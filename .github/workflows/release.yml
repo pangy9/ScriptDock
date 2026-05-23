@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Zip app
+        run: |
+          cd ScriptDock.app/..
+          zip -r "${{ github.workspace }}/ScriptDock.zip" ScriptDock.app
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ScriptDock.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ScriptDock.zip
+          generate_release_notes: true

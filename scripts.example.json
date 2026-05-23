@@ -1,0 +1,28 @@
+{
+  "tasks": [
+    {
+      "id": "example-web-server",
+      "name": "Example Web Server",
+      "programArguments": ["/usr/local/bin/node", "server.js"],
+      "workingDirectory": "/Users/you/projects/my-app",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "ports": [3000],
+      "environment": {
+        "NODE_ENV": "development"
+      }
+    },
+    {
+      "id": "example-ssh-tunnel",
+      "name": "SSH Tunnel",
+      "programArguments": [
+        "/usr/bin/ssh",
+        "-v", "-p", "22222",
+        "-N", "-L", "8080:127.0.0.1:8080",
+        "user@example.com"
+      ],
+      "runAtLoad": true,
+      "keepAlive": true
+    }
+  ]
+}

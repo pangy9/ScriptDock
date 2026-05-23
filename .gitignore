@@ -1,0 +1,6 @@
+ScriptDock.app/
+*.log
+.DS_Store
+.claude/
+PLAN.md
+tools/
