@@ -1493,14 +1493,43 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
             let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.tertiaryLabelColor]
             result.append(NSAttributedString(string: "(empty)", attributes: attrs))
         } else {
-            for line in stdout.split(separator: "\n", omittingEmptySubsequences: false) {
-                result.append(NSAttributedString(string: line + "\n", attributes: [.font: font, .foregroundColor: stdoutColor]))
+            // Interleave stdout and stderr lines by timestamp
+            struct TaggedLine {
+                let time: Int          // seconds since midnight; -1 for untagged lines
+                let text: String
+                let isStderr: Bool
             }
-            if !stdout.isEmpty && !stderr.isEmpty {
-                result.append(NSAttributedString(string: "\n"))
+            var tagged: [TaggedLine] = []
+
+            let streams: [(text: String, isStderr: Bool)] = [(stdout, false), (stderr, true)]
+            for (text, isStderr) in streams {
+                var lines = text.components(separatedBy: "\n")
+                // Drop trailing empty string from split
+                if let last = lines.last, last.isEmpty { lines.removeLast() }
+                for line in lines {
+                    var time = -1
+                    // Parse [HH:MM:SS] prefix
+                    if let bracket = line.firstIndex(of: "]"),
+                       line.hasPrefix("[") {
+                        let ts = String(line[line.index(after: line.startIndex)..<bracket])
+                        let parts = ts.split(separator: ":")
+                        if parts.count == 3,
+                           let h = Int(parts[0]), let m = Int(parts[1]), let s = Int(parts[2]) {
+                            time = h * 3600 + m * 60 + s
+                        }
+                    }
+                    tagged.append(TaggedLine(time: time, text: line, isStderr: isStderr))
+                }
             }
-            for line in stderr.split(separator: "\n", omittingEmptySubsequences: false) {
-                result.append(NSAttributedString(string: line + "\n", attributes: [.font: font, .foregroundColor: stderrColor]))
+            tagged.sort { $0.time < $1.time }
+
+            for entry in tagged {
+                let color = entry.isStderr ? stderrColor : stdoutColor
+                let attrLine = NSAttributedString(
+                    string: entry.text + "\n",
+                    attributes: [.font: font, .foregroundColor: color]
+                )
+                result.append(attrLine)
             }
         }
 
