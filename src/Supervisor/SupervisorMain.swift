@@ -126,6 +126,10 @@ final class ManagedTask {
         self.startedBy = source
         self.stoppedManually = false
 
+        // Clear buffers and files for a fresh run
+        stdoutBuffer.clear()
+        stderrBuffer.clear()
+
         let allArgs = config.programArguments + (extraArgs ?? [])
         let process = Process()
         let executable = ManagedTask.resolveExecutable(allArgs[0])
@@ -144,8 +148,9 @@ final class ManagedTask {
 
         let stdoutURL = logsURL.appendingPathComponent("\(config.id).out.log")
         let stderrURL = logsURL.appendingPathComponent("\(config.id).err.log")
-        FileManager.default.createFile(atPath: stdoutURL.path, contents: nil)
-        FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
+        // Truncate log files for a fresh run
+        try? "".write(to: stdoutURL, atomically: true, encoding: .utf8)
+        try? "".write(to: stderrURL, atomically: true, encoding: .utf8)
 
         let stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
         let stderrHandle = try FileHandle(forWritingTo: stderrURL)
