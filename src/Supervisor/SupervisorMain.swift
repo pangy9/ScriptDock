@@ -51,7 +51,7 @@ final class RingBuffer {
 // MARK: - Managed Task
 
 final class ManagedTask {
-    let config: ScriptTask
+    var config: ScriptTask
     var state: TaskState = .stopped
     var pid: Int32?
     var exitCode: Int32?
@@ -309,7 +309,12 @@ final class Supervisor {
             managedTasks.removeValue(forKey: id)
         }
         for task in store.tasks {
-            if managedTasks[task.id] == nil {
+            if let existing = managedTasks[task.id] {
+                // Only update config when stopped — don't mutate a running task
+                if existing.state == .stopped || existing.state == .errored {
+                    existing.config = task
+                }
+            } else {
                 managedTasks[task.id] = ManagedTask(config: task)
             }
         }
@@ -328,9 +333,11 @@ final class Supervisor {
 
         // Add new tasks, update existing
         for task in result.tasks {
-            if managedTasks[task.id] != nil {
-                // Update config but keep running state
-                // For simplicity, managedTasks hold references to old config until restart
+            if let existing = managedTasks[task.id] {
+                // Only update config when stopped — don't mutate a running task
+                if existing.state == .stopped || existing.state == .errored {
+                    existing.config = task
+                }
             } else {
                 managedTasks[task.id] = ManagedTask(config: task)
             }
