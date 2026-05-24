@@ -294,6 +294,12 @@ final class Supervisor {
         return (data, buffer.count)
     }
 
+    func clearLogs(id: String) {
+        guard let managed = managedTasks[id] else { return }
+        managed.stdoutBuffer.clear()
+        managed.stderrBuffer.clear()
+    }
+
     /// Sync managed tasks with the store's task list (called after config reload).
     /// Does not call store.reload() — the caller should do that first.
     func syncTasks() {

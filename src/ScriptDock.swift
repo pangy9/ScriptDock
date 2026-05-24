@@ -1749,8 +1749,11 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
     @objc private func clearLogView() {
         guard let task = selectedTask else { return }
         let store = app.store
+        // Clear on-disk log files
         try? Data().write(to: store.stdoutURL(for: task))
         try? Data().write(to: store.stderrURL(for: task))
+        // Clear in-memory ring buffers
+        app.supervisor.clearLogs(id: task.id)
         setLogText("")
     }
 
