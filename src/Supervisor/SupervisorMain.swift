@@ -241,7 +241,7 @@ final class Supervisor {
         for task in result.tasks {
             let managed = ManagedTask(config: task)
             managedTasks[task.id] = managed
-            if autoStart && task.effectiveMode == .daemon {
+            if autoStart && task.runAtLoad == true {
                 _ = startTask(id: task.id, source: "auto")
             }
         }
