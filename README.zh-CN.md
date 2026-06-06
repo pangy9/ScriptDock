@@ -25,12 +25,12 @@ ScriptDock 解决这个问题——给每个脚本一个"家"，在一个持久�
 
 ## 主要功能
 
-- **进程管理器** — ScriptDock 通过 `Foundation.Process` 直接管理子进程。Daemon 任务崩溃后自动重启；One-shot 任务运行一次并报告退出码。重启电脑后自动恢复。
+- **进程管理器** — ScriptDock 通过 `Foundation.Process` 直接管理子进程。Daemon 任务在 ScriptDock 运行期间崩溃后自动重启；One-shot 任务运行一次并报告退出码。Run-at-load 任务会在 ScriptDock 启动时恢复。
 - **实时仪表盘** — 侧边栏按状态分组（运行中 / 已停止），选中任意任务查看实时日志、端口占用、PID。
 - **内联控制** — 侧边栏直接提供播放、停止、重启按钮，无需切换上下文。
 - **日志查看器** — 环形缓冲的 stdout / stderr 实时流，支持搜索和流切换。时间戳在 Pipe 层直接注入，无需 wrapper 脚本，无缓冲问题。
 - **端口监控** — 自动从 `openURL`、`--port` 参数、SSH `-L` 转发、`PORT` 环境变量中推断端口。一键杀掉占用端口的进程。
-- **任务模式** — 在 *Daemon*（崩溃自动重启，随 app 恢复）和 *One-shot*（运行一次，显示退出码）之间选择。
+- **任务模式** — 在 *Daemon*（ScriptDock 运行期间崩溃自动重启）和 *One-shot*（运行一次，显示退出码）之间选择。
 - **MCP 服务器** — 内置 Model Context Protocol 服务器，让 AI 编程助手（Claude Code、Cursor）直接列出进程、读取日志、启停任务、注册新进程，不用离开编辑器。
 - **默认安全** — 命令使用显式 argv 数组（无 shell 注入风险），任务 ID 限制为安全字符，一切以当前用户权限运行，不需要 `sudo`。
 
@@ -83,6 +83,7 @@ xattr -cr /Applications/ScriptDock.app
       "mode": "daemon",
       "runAtLoad": true,
       "keepAlive": true,
+      "keepRunningOnQuit": false,
       "ports": [3000],
       "environment": { "NODE_ENV": "development" }
     },
@@ -96,7 +97,7 @@ xattr -cr /Applications/ScriptDock.app
 }
 ```
 
-每个任务使用 argv 数组。`mode` 可选 `daemon`（崩溃自动重启）或 `oneshot`（运行一次）。未设置 `mode` 时从 `keepAlive`/`runAtLoad` 推断，向后兼容。随时从菜单栏或仪表盘重新加载配置。
+每个任务使用 argv 数组。`mode` 可选 `daemon`（ScriptDock 运行期间崩溃自动重启）或 `oneshot`（运行一次）。未设置 `mode` 时从 `keepAlive`/`runAtLoad` 推断，向后兼容。退出 ScriptDock 时会向运行中的任务发送停止信号，除非将 `keepRunningOnQuit` 设为 `true`。随时从菜单栏或仪表盘重新加载配置。
 
 ## MCP 集成
 

@@ -159,31 +159,39 @@ final class ManagedTask {
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
+        let usesPipeLogging = config.keepRunningOnQuit != true
+        if usesPipeLogging {
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+        } else {
+            process.standardOutput = stdoutHandle
+            process.standardError = stderrHandle
+        }
 
         self.process = process
-        self.stdoutPipe = stdoutPipe
-        self.stderrPipe = stderrPipe
+        self.stdoutPipe = usesPipeLogging ? stdoutPipe : nil
+        self.stderrPipe = usesPipeLogging ? stderrPipe : nil
         self.stdoutHandle = stdoutHandle
         self.stderrHandle = stderrHandle
 
-        // Read stdout into ring buffer + file (with timestamp injection)
-        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let tsData = ManagedTask.injectTimestamps(data)
-            self?.stdoutBuffer.append(tsData)
-            self?.stdoutHandle?.write(tsData)
-        }
+        if usesPipeLogging {
+            // Read stdout into ring buffer + file (with timestamp injection)
+            stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                guard !data.isEmpty else { return }
+                let tsData = ManagedTask.injectTimestamps(data)
+                self?.stdoutBuffer.append(tsData)
+                self?.stdoutHandle?.write(tsData)
+            }
 
-        // Read stderr into ring buffer + file (with timestamp injection)
-        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let tsData = ManagedTask.injectTimestamps(data)
-            self?.stderrBuffer.append(tsData)
-            self?.stderrHandle?.write(tsData)
+            // Read stderr into ring buffer + file (with timestamp injection)
+            stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                guard !data.isEmpty else { return }
+                let tsData = ManagedTask.injectTimestamps(data)
+                self?.stderrBuffer.append(tsData)
+                self?.stderrHandle?.write(tsData)
+            }
         }
 
         process.terminationHandler = { [weak self] _ in
@@ -222,6 +230,10 @@ final class ManagedTask {
     func terminate() {
         process?.terminate()
     }
+
+    var shouldStopOnAppQuit: Bool {
+        state == .running && config.keepRunningOnQuit != true
+    }
 }
 
 // MARK: - Supervisor
@@ -236,7 +248,7 @@ final class Supervisor {
         self.store = store
     }
 
-    func start(autoStart: Bool = true) {
+    func start(autoStart: Bool = true, startHTTPServer: Bool = true) {
         let result = store.reload()
         for task in result.tasks {
             let managed = ManagedTask(config: task)
@@ -246,8 +258,10 @@ final class Supervisor {
             }
         }
 
-        httpServer = HTTPServer(supervisor: self)
-        httpServer?.start()
+        if startHTTPServer {
+            httpServer = HTTPServer(supervisor: self)
+            httpServer?.start()
+        }
     }
 
     func taskIDs() -> [String] {
@@ -260,6 +274,10 @@ final class Supervisor {
 
     func allStatuses() -> [TaskStatus] {
         store.tasks.compactMap { managedTasks[$0.id]?.status }
+    }
+
+    func hasTasksToStopOnAppQuit() -> Bool {
+        managedTasks.values.contains { $0.shouldStopOnAppQuit }
     }
 
     func startTask(id: String, source: String? = nil, extraArgs: [String]? = nil) -> String? {
@@ -357,6 +375,12 @@ final class Supervisor {
 
     func killPort(pids: [Int32]) -> (killed: [Int32], failed: [Int32]) {
         PortInspector.killPIDs(pids)
+    }
+
+    func shutdownForAppQuit(timeout: TimeInterval = 1.0) {
+        for managed in managedTasks.values where managed.shouldStopOnAppQuit {
+            managed.stop(timeout: timeout)
+        }
     }
 
     private func handleTaskExit(_ task: ManagedTask) {

@@ -17,6 +17,7 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
     private var quickLaunchPanel: QuickLaunchPanel?
     private var globalHotKey: EventHotKeyRef?
     private var hotKeyEventHandler: EventHandlerRef?
+    private var isTerminating = false
     private(set) var supervisor: Supervisor!
 
     static func main() {
@@ -44,6 +45,20 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.rebuildMenu()
         }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isTerminating else { return .terminateNow }
+        guard supervisor.hasTasksToStopOnAppQuit() else { return .terminateNow }
+
+        isTerminating = true
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        supervisor.shutdownForAppQuit(timeout: 1.0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.25) {
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     private func setupMainMenu() {
@@ -2239,6 +2254,7 @@ final class TaskEditorWindowController: NSWindowController {
     private let urlField = NSTextField()
     private let autoStartCheck = NSButton(checkboxWithTitle: "Auto Start", target: nil, action: nil)
     private let keepAliveCheck = NSButton(checkboxWithTitle: "Keep Alive", target: nil, action: nil)
+    private let keepRunningOnQuitCheck = NSButton(checkboxWithTitle: "Keep Running on Quit", target: nil, action: nil)
     private let modeSegment = NSSegmentedControl(labels: ["Daemon", "One-shot"], trackingMode: .selectOne, target: nil, action: nil)
     private let errorLabel = NSTextField(labelWithString: "")
     private let venvPopup = NSPopUpButton()
@@ -2396,9 +2412,10 @@ final class TaskEditorWindowController: NSWindowController {
         addRow("Mode", modeSegment, yOffset: &yOffset)
 
         // Checkboxes
-        let checkStack = NSStackView(views: [autoStartCheck, keepAliveCheck])
+        keepRunningOnQuitCheck.toolTip = "Do not send a stop signal to this task when ScriptDock quits."
+        let checkStack = NSStackView(views: [autoStartCheck, keepAliveCheck, keepRunningOnQuitCheck])
         checkStack.orientation = .horizontal
-        checkStack.spacing = 20
+        checkStack.spacing = 14
         checkStack.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(checkStack)
         NSLayoutConstraint.activate([
@@ -2447,6 +2464,7 @@ final class TaskEditorWindowController: NSWindowController {
         urlField.stringValue = task.openURL ?? ""
         autoStartCheck.state = (task.runAtLoad ?? false) ? .on : .off
         keepAliveCheck.state = (task.keepAlive ?? false) ? .on : .off
+        keepRunningOnQuitCheck.state = (task.keepRunningOnQuit ?? false) ? .on : .off
         modeSegment.selectedSegment = task.effectiveMode == .daemon ? 0 : 1
         updateCheckboxVisibility()
         if let env = task.environment {
@@ -2569,6 +2587,7 @@ final class TaskEditorWindowController: NSWindowController {
             ports: ports.isEmpty ? nil : ports,
             environment: env.isEmpty ? nil : env,
             optionalArguments: optionalArguments,
+            keepRunningOnQuit: keepRunningOnQuitCheck.state == .on,
             mode: modeSegment.selectedSegment == 0 ? .daemon : .oneshot
         )
         // Preserve fields not in the editor

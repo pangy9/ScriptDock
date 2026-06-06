@@ -3,4 +3,6 @@ ScriptDock.app/
 .DS_Store
 .claude/
 PLAN.md
-tools/
+config-backups/
+tools/*
+!tools/smoke_test.py

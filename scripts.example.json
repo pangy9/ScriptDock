@@ -7,6 +7,7 @@
       "workingDirectory": "/Users/you/projects/my-app",
       "runAtLoad": true,
       "keepAlive": true,
+      "keepRunningOnQuit": false,
       "ports": [3000],
       "environment": {
         "NODE_ENV": "development"
@@ -22,7 +23,8 @@
         "user@example.com"
       ],
       "runAtLoad": true,
-      "keepAlive": true
+      "keepAlive": true,
+      "keepRunningOnQuit": false
     }
   ]
 }

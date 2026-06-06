@@ -15,6 +15,7 @@ struct ScriptTask: Codable {
     var ports: [Int]?
     var environment: [String: String]?
     var optionalArguments: [OptionalArgument]?
+    var keepRunningOnQuit: Bool?
     var mode: TaskMode?
 
     var label: String {

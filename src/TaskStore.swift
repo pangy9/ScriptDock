@@ -8,9 +8,14 @@ final class TaskStore {
 
     private(set) var tasks: [ScriptTask] = []
 
-    init() {
+    convenience init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        self.appSupportURL = home.appendingPathComponent("Library/Application Support/ScriptDock", isDirectory: true)
+        self.init(appSupportURL: home.appendingPathComponent("Library/Application Support/ScriptDock", isDirectory: true))
+    }
+
+    init(appSupportURL: URL) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        self.appSupportURL = appSupportURL
         self.configURL = appSupportURL.appendingPathComponent("scripts.json")
         self.logsURL = appSupportURL.appendingPathComponent("logs", isDirectory: true)
         self.launchAgentsURL = home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)

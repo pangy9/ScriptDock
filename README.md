@@ -25,12 +25,12 @@ ScriptDock fixes this by giving every script a home in a persistent, searchable 
 
 ## Highlights
 
-- **Process supervisor** — ScriptDock manages child processes directly via `Foundation.Process`. Daemon tasks auto-restart on crash; one-shot tasks run once and report their exit code. Everything recovers after a reboot.
+- **Process supervisor** — ScriptDock manages child processes directly via `Foundation.Process`. Daemon tasks auto-restart on crash while ScriptDock is running; one-shot tasks run once and report their exit code. Run-at-load tasks recover when ScriptDock starts.
 - **Real-time dashboard** — sidebar groups tasks by status (Running / Stopped); select any task to see live logs, port usage, and PID in the detail panel.
 - **Inline controls** — play, stop, and restart buttons directly in the sidebar. No context-switching.
 - **Log viewer** — ring-buffered stdout and stderr streams with live tail, search, and stream switching. Timestamps are injected at the pipe level — no wrapper scripts, no buffering issues.
 - **Port monitoring** — automatically detects ports from `openURL`, `--port` flags, SSH `-L` forwards, and `PORT` environment variables. One click to kill a process blocking a port you need.
-- **Task modes** — choose between *Daemon* (auto-restart on crash, survives app restart) and *One-shot* (run once, show exit code).
+- **Task modes** — choose between *Daemon* (auto-restart on crash while ScriptDock is running) and *One-shot* (run once, show exit code).
 - **MCP server** — built-in Model Context Protocol server lets AI assistants (Claude Code, Cursor) list your processes, read logs, start and stop tasks, and register new ones without you leaving the editor.
 - **Safe by default** — commands are explicit argv arrays (no shell injection surface), task IDs are restricted to safe characters, everything runs as your user with no `sudo`.
 
@@ -83,6 +83,7 @@ Edit `scripts.json` (or use the built-in task editor) to add tasks:
       "mode": "daemon",
       "runAtLoad": true,
       "keepAlive": true,
+      "keepRunningOnQuit": false,
       "ports": [3000],
       "environment": { "NODE_ENV": "development" }
     },
@@ -96,7 +97,7 @@ Edit `scripts.json` (or use the built-in task editor) to add tasks:
 }
 ```
 
-Each task uses an argv array. `mode` can be `daemon` (auto-restart on crash) or `oneshot` (run once). For backward compatibility, tasks without `mode` infer it from `keepAlive`/`runAtLoad`. Reload config from the menu bar or Dashboard at any time.
+Each task uses an argv array. `mode` can be `daemon` (auto-restart on crash while ScriptDock is running) or `oneshot` (run once). For backward compatibility, tasks without `mode` infer it from `keepAlive`/`runAtLoad`. ScriptDock sends a stop signal to running tasks when you quit the app unless `keepRunningOnQuit` is set to `true`. Reload config from the menu bar or Dashboard at any time.
 
 ## MCP Integration
 
