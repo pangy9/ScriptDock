@@ -21,6 +21,23 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
     private(set) var supervisor: Supervisor!
 
     static func main() {
+        // 单实例保护：抢独占文件锁。已有实例持锁 → 静默退出，根治双进程
+        // （含开机自启两条途径同时触发）。锁在进程退出时由内核自动释放。
+        let supportDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/ScriptDock", isDirectory: true)
+        try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        let lockFD = open(supportDir.appendingPathComponent("single.lock").path,
+                          O_CREAT | O_RDWR | O_CLOEXEC, 0o644)
+        guard lockFD >= 0 else {
+            fputs("ScriptDock: cannot open single-instance lock\n", stderr)
+            exit(1)
+        }
+        if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
+            fputs("ScriptDock: another instance is already running\n", stderr)
+            exit(0)
+        }
+        // lockFD 故意保持打开，持锁到进程退出。
+
         let app = NSApplication.shared
         let delegate = ScriptDockApp()
         app.delegate = delegate
@@ -38,7 +55,7 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
         supervisor = Supervisor(store: store)
         supervisor.start()
         migrateFromLaunchd()
-        ensureSelfLaunchAgent()
+        syncLaunchAgentState()
         reloadConfig(showAlert: false)
         setupStatusItem()
         registerGlobalHotKey()
@@ -163,6 +180,10 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Open Config", action: #selector(openConfig), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Open Logs Folder", action: #selector(openLogsFolder), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        launchItem.target = self
+        launchItem.state = isLaunchAtLoginEnabled() ? .on : .off
+        menu.addItem(launchItem)
         menu.addItem(NSMenuItem(title: "About ScriptDock", action: #selector(showAbout), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
@@ -230,6 +251,11 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
 
     @objc private func reloadConfigItem() {
         reloadConfig(showAlert: true)
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        setLaunchAtLogin(!isLaunchAtLoginEnabled())
+        rebuildMenu()
     }
 
     @objc private func openConfig() {
@@ -569,29 +595,61 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func ensureSelfLaunchAgent() {
+    // MARK: - Launch at Login (user-controllable LaunchAgent)
+
+    /// 用户期望开关的真值 = plist 是否存在（菜单 ✓ 据此显示）。
+    private func isLaunchAtLoginEnabled() -> Bool {
+        FileManager.default.fileExists(atPath: selfLaunchAgentURL().path)
+    }
+
+    /// launchd 是否已加载该 job（仅供同步决策，与「用户意图」分开）。
+    private func isLaunchAgentLoaded() -> Bool {
+        ProcessRunner.run("/bin/launchctl", arguments: ["list", selfLaunchAgentLabel]).status == 0
+    }
+
+    /// 写/重写 plist；ProgramArguments 始终用当前 executablePath 覆盖
+    /// （防 .app 移动后路径漂移，否则旧 plist 会指向失效二进制）。
+    private func writeLaunchAgentPlist() throws {
         guard let executablePath = Bundle.main.executablePath else { return }
         let plist: [String: Any] = [
             "Label": selfLaunchAgentLabel,
             "ProgramArguments": [executablePath],
             "RunAtLoad": true,
             "KeepAlive": false,
-            "WorkingDirectory": FileManager.default.homeDirectoryForCurrentUser.path
+            "WorkingDirectory": FileManager.default.homeDirectoryForCurrentUser.path,
         ]
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try data.write(to: selfLaunchAgentURL(), options: .atomic)
+    }
 
-        do {
-            let data = try PropertyListSerialization.data(
-                fromPropertyList: plist,
-                format: .xml,
-                options: 0
-            )
-            let url = selfLaunchAgentURL()
-            if let existing = try? Data(contentsOf: url), existing == data {
+    /// 用户开关：enabled 写 plist 并按需加载；disabled 卸载并删除 plist。
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        if enabled {
+            do {
+                try writeLaunchAgentPlist()
+            } catch {
+                showError("Failed to enable ScriptDock auto-launch at login: \(error.localizedDescription)")
                 return
             }
-            try data.write(to: url, options: .atomic)
-        } catch {
-            showError("Failed to enable ScriptDock auto-launch at login: \(error.localizedDescription)")
+            if !isLaunchAgentLoaded() {
+                _ = ProcessRunner.run("/bin/launchctl", arguments: ["bootstrap", "gui/\(getuid())", selfLaunchAgentURL().path])
+            }
+        } else {
+            // bootout 对未加载的 label 会报错，忽略返回值（沿用 migrateFromLaunchd 的处理）。
+            _ = ProcessRunner.run("/bin/launchctl", arguments: ["bootout", "gui/\(getuid())/\(selfLaunchAgentLabel)"])
+            try? FileManager.default.removeItem(at: selfLaunchAgentURL())
+        }
+    }
+
+    /// 启动时校准：让 launchd 实际加载状态与「plist 是否存在」一致。
+    private func syncLaunchAgentState() {
+        if isLaunchAtLoginEnabled() {
+            // 迁移：旧版 plist 可能存在但 launchd 从未加载 → 首次真正交给 launchd。
+            if !isLaunchAgentLoaded() {
+                _ = ProcessRunner.run("/bin/launchctl", arguments: ["bootstrap", "gui/\(getuid())", selfLaunchAgentURL().path])
+            }
+        } else if isLaunchAgentLoaded() {
+            _ = ProcessRunner.run("/bin/launchctl", arguments: ["bootout", "gui/\(getuid())/\(selfLaunchAgentLabel)"])
         }
     }
 
