@@ -4,6 +4,17 @@ struct ScriptConfig: Codable {
     var tasks: [ScriptTask]
 }
 
+enum UserPath {
+    static func expandingTilde(_ value: String) -> String {
+        guard value == "~" || value.hasPrefix("~/") else { return value }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        guard value != "~" else { return home }
+        return URL(fileURLWithPath: home)
+            .appendingPathComponent(String(value.dropFirst(2)))
+            .path
+    }
+}
+
 struct ScriptTask: Codable {
     var id: String
     var name: String

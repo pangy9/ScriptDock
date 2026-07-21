@@ -500,7 +500,7 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     fileprivate func revealExecutable(for task: ScriptTask) {
         guard let first = task.programArguments.first else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: first)])
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: UserPath.expandingTilde(first))])
     }
 
     // MARK: - Process Management
@@ -789,7 +789,7 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
     private let logScrollView = NSScrollView()
     private let logSearchField = NSSearchField()
     private let streamControl = NSSegmentedControl(labels: ["Combined", "stdout", "stderr"], trackingMode: .selectOne, target: nil, action: nil)
-    private let liveCheckbox = NSButton(checkboxWithTitle: "Live", target: nil, action: nil)
+    private let autoScrollCheckbox = NSButton(checkboxWithTitle: "Auto-scroll", target: nil, action: nil)
     private let clearLogButton = NSButton(title: "Clear", target: nil, action: nil)
 
     private var isDarkMode: Bool {
@@ -1068,10 +1068,11 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
         logSearchField.action = #selector(logSearchChanged)
         logSearchField.translatesAutoresizingMaskIntoConstraints = false
 
-        liveCheckbox.state = .on
-        liveCheckbox.target = self
-        liveCheckbox.action = #selector(liveToggled)
-        liveCheckbox.translatesAutoresizingMaskIntoConstraints = false
+        autoScrollCheckbox.state = .on
+        autoScrollCheckbox.toolTip = "Keep the log view pinned to the newest output."
+        autoScrollCheckbox.target = self
+        autoScrollCheckbox.action = #selector(autoScrollToggled)
+        autoScrollCheckbox.translatesAutoresizingMaskIntoConstraints = false
 
         clearLogButton.bezelStyle = .recessed
         clearLogButton.controlSize = .small
@@ -1079,7 +1080,7 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
         clearLogButton.action = #selector(clearLogView)
         clearLogButton.translatesAutoresizingMaskIntoConstraints = false
 
-        let logToolbar = NSStackView(views: [streamControl, logSearchField, liveCheckbox, clearLogButton])
+        let logToolbar = NSStackView(views: [streamControl, logSearchField, autoScrollCheckbox, clearLogButton])
         logToolbar.orientation = .horizontal
         logToolbar.spacing = 8
         logToolbar.translatesAutoresizingMaskIntoConstraints = false
@@ -1433,7 +1434,7 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
                     }
                 }
             }
-            self.updateDetail(refreshLogsOnly: self.liveCheckbox.state == .on)
+            self.updateDetail()
             self.app.updateStatusTitle()
         }
     }
@@ -1672,7 +1673,7 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
     }
 
     private func autoScrollLog() {
-        guard liveCheckbox.state == .on, !userScrolledUp else { return }
+        guard autoScrollCheckbox.state == .on, !userScrolledUp else { return }
         logTextView.scrollRangeToVisible(NSRange(location: logTextView.string.count, length: 0))
     }
 
@@ -1890,9 +1891,10 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
         updateDetail(refreshLogsOnly: true)
     }
 
-    @objc private func liveToggled() {
-        if liveCheckbox.state == .on {
+    @objc private func autoScrollToggled() {
+        if autoScrollCheckbox.state == .on {
             userScrolledUp = false
+            autoScrollLog()
         }
     }
 
@@ -2493,7 +2495,7 @@ final class TaskEditorWindowController: NSWindowController {
         let commandRowHeight: CGFloat = 56  // 2-line command input
         addRowWithBrowse("Command", commandScrollView, browseAction: #selector(browseCommand), yOffset: &yOffset, height: commandRowHeight)
 
-        workDirField.placeholderString = "e.g. /Users/you/code/app"
+        workDirField.placeholderString = "e.g. ~/code/app"
         addRowWithBrowse("Working Dir", workDirField, browseAction: #selector(browseWorkDir), yOffset: &yOffset)
 
         envField.placeholderString = "e.g. PORT=5173,DEBUG=1"
@@ -2620,7 +2622,7 @@ final class TaskEditorWindowController: NSWindowController {
         }
 
         // Validate executable exists
-        let executable = args[0]
+        let executable = UserPath.expandingTilde(args[0])
         if executable.contains("/") {
             if !FileManager.default.fileExists(atPath: executable) {
                 errorLabel.stringValue = "Program does not exist: \(executable)"
@@ -2650,7 +2652,7 @@ final class TaskEditorWindowController: NSWindowController {
         let workDir = workDirField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Validate working directory exists if specified
-        if !workDir.isEmpty && !FileManager.default.fileExists(atPath: workDir) {
+        if !workDir.isEmpty && !FileManager.default.fileExists(atPath: UserPath.expandingTilde(workDir)) {
             errorLabel.stringValue = "Working directory does not exist: \(workDir)"
             return
         }
@@ -2760,8 +2762,9 @@ final class TaskEditorWindowController: NSWindowController {
         panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true
         let currentPath = workDirField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !currentPath.isEmpty, FileManager.default.fileExists(atPath: currentPath) {
-            panel.directoryURL = URL(fileURLWithPath: currentPath)
+        let expandedCurrentPath = UserPath.expandingTilde(currentPath)
+        if !currentPath.isEmpty, FileManager.default.fileExists(atPath: expandedCurrentPath) {
+            panel.directoryURL = URL(fileURLWithPath: expandedCurrentPath)
         }
         guard panel.runModal() == .OK, let url = panel.url else { return }
         workDirField.stringValue = url.path

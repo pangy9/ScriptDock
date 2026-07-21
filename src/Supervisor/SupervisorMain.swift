@@ -101,12 +101,13 @@ final class ManagedTask {
     }
 
     static func resolveExecutable(_ path: String) -> String {
-        if path.contains("/") { return path }
-        let result = ProcessRunner.run("/usr/bin/which", arguments: [path])
+        let expandedPath = UserPath.expandingTilde(path)
+        if expandedPath.contains("/") { return expandedPath }
+        let result = ProcessRunner.run("/usr/bin/which", arguments: [expandedPath])
         if result.status == 0 {
             return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        return path
+        return expandedPath
     }
 
     var status: TaskStatus {
@@ -139,12 +140,14 @@ final class ManagedTask {
         stdoutBuffer.clear()
         stderrBuffer.clear()
 
-        let allArgs = config.programArguments + (extraArgs ?? [])
+        let allArgs = (config.programArguments + (extraArgs ?? [])).map(UserPath.expandingTilde)
         let process = Process()
         let executable = ManagedTask.resolveExecutable(allArgs[0])
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = Array(allArgs.dropFirst())
-        process.currentDirectoryURL = URL(fileURLWithPath: config.workingDirectory ?? FileManager.default.homeDirectoryForCurrentUser.path)
+        let workingDirectory = config.workingDirectory.map(UserPath.expandingTilde)
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
 
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONUNBUFFERED"] = "1"

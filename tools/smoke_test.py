@@ -348,6 +348,104 @@ def compile_and_run_closed_stream_test():
         run([str(binary)], env=env)
 
 
+def compile_and_run_tilde_path_test():
+    """Regression test: execution expands ~ and ~/ without rewriting the config."""
+    with tempfile.TemporaryDirectory(prefix="scriptdock-tilde-") as tmp:
+        tmp_path = Path(tmp)
+        support = tmp_path / "support"
+        support.mkdir(parents=True)
+        config = support / "scripts.json"
+        config.write_text(
+            textwrap.dedent(
+                r'''
+                {
+                  "tasks": [
+                    {
+                      "id": "tilde-paths",
+                      "name": "Tilde Paths",
+                      "programArguments": [
+                        "/bin/sh",
+                        "-c",
+                        "printf '%s\\n%s\\n' \"$PWD\" \"$1\"; sleep 0.2",
+                        "probe",
+                        "~"
+                      ],
+                      "workingDirectory": "~",
+                      "mode": "oneshot"
+                    }
+                  ]
+                }
+                '''
+            ).strip()
+        )
+
+        test_main = tmp_path / "TildePathTest.swift"
+        test_main.write_text(
+            textwrap.dedent(
+                """
+                import Darwin
+                import Foundation
+
+                func assertCondition(_ condition: @autoclosure () -> Bool, _ message: String) {
+                    if !condition() {
+                        fputs("Assertion failed: \\(message)\\n", stderr)
+                        exit(1)
+                    }
+                }
+
+                @main
+                struct TildePathTest {
+                    static func main() {
+                        let home = FileManager.default.homeDirectoryForCurrentUser.path
+                        assertCondition(UserPath.expandingTilde("~") == home, "~ should expand to the current user's home")
+                        assertCondition(
+                            UserPath.expandingTilde("~/example") == URL(fileURLWithPath: home).appendingPathComponent("example").path,
+                            "~/example should expand below the current user's home"
+                        )
+                        assertCondition(
+                            ManagedTask.resolveExecutable("~/bin/tool") == URL(fileURLWithPath: home).appendingPathComponent("bin/tool").path,
+                            "executable paths should expand ~/"
+                        )
+
+                        let store = TaskStore(appSupportURL: URL(fileURLWithPath: "__APP_SUPPORT__"))
+                        try! store.ensureSupportFiles()
+                        _ = store.reload()
+                        assertCondition(store.preflightProblem(for: store.tasks[0]) == nil, "preflight should accept ~ paths")
+
+                        let supervisor = Supervisor(store: store)
+                        supervisor.start(autoStart: false, startHTTPServer: false)
+                        assertCondition(supervisor.startTask(id: "tilde-paths", source: "test") == nil, "tilde task should start")
+
+                        let deadline = Date().addingTimeInterval(3)
+                        while supervisor.taskStatus(id: "tilde-paths")?.state == .running && Date() < deadline {
+                            usleep(50_000)
+                        }
+                        usleep(200_000)
+
+                        let data = supervisor.readLogs(id: "tilde-paths", stream: .stdout, since: 0)?.data ?? Data()
+                        let output = String(data: data, encoding: .utf8) ?? ""
+                        let matchingLines = output.components(separatedBy: "\\n").filter { $0.contains(home) }
+                        assertCondition(matchingLines.count >= 2, "working directory and argv should both expand ~; output: \\(output)")
+                        exit(0)
+                    }
+                }
+                """
+            ).strip().replace("__APP_SUPPORT__", str(support))
+        )
+
+        binary = tmp_path / "TildePathTest"
+        sources = [
+            ROOT / "src/Models.swift",
+            ROOT / "src/TaskStore.swift",
+            ROOT / "src/ProcessRunner.swift",
+            ROOT / "src/PortInspector.swift",
+            ROOT / "src/Supervisor/SupervisorMain.swift",
+            test_main,
+        ]
+        run(["swiftc", *map(str, sources), "-parse-as-library", "-o", str(binary)])
+        run([str(binary)])
+
+
 def main():
     if not shutil.which("swiftc"):
         print("swiftc not found", file=sys.stderr)
@@ -355,6 +453,7 @@ def main():
     compile_and_run_supervisor_shutdown_test()
     compile_and_run_detached_writer_test()
     compile_and_run_closed_stream_test()
+    compile_and_run_tilde_path_test()
     return 0
 
 

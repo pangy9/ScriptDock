@@ -272,7 +272,7 @@ final class MCPServer {
         }
 
         // Validate working directory if provided
-        if !workDir.isEmpty && !FileManager.default.fileExists(atPath: workDir) {
+        if !workDir.isEmpty && !FileManager.default.fileExists(atPath: UserPath.expandingTilde(workDir)) {
             return "Error: working directory does not exist: \(workDir)"
         }
 

@@ -105,7 +105,8 @@ final class TaskStore {
         if task.programArguments.isEmpty {
             return "Task has empty programArguments: \(task.name)"
         }
-        if task.programArguments[0].contains("/") && !FileManager.default.isExecutableFile(atPath: task.programArguments[0]) {
+        let executable = UserPath.expandingTilde(task.programArguments[0])
+        if executable.contains("/") && !FileManager.default.isExecutableFile(atPath: executable) {
             return "Program is not executable: \(task.programArguments[0])"
         }
         return argumentShapeProblem(for: task)
@@ -120,7 +121,7 @@ final class TaskStore {
             return "\(task.name) has empty programArguments."
         }
 
-        let executable = task.programArguments[0]
+        let executable = UserPath.expandingTilde(task.programArguments[0])
         if executable.contains("/") && !FileManager.default.isExecutableFile(atPath: executable) {
             return """
             Program is not executable or does not exist:
@@ -132,7 +133,8 @@ final class TaskStore {
         }
 
         for argument in task.programArguments.dropFirst() {
-            if shouldValidatePathArgument(argument), !FileManager.default.fileExists(atPath: argument) {
+            let expandedArgument = UserPath.expandingTilde(argument)
+            if shouldValidatePathArgument(argument), !FileManager.default.fileExists(atPath: expandedArgument) {
                 return """
                 Config path does not exist:
                 \(argument)
@@ -146,7 +148,8 @@ final class TaskStore {
             }
         }
 
-        if let cwd = task.workingDirectory, !FileManager.default.fileExists(atPath: cwd) {
+        if let cwd = task.workingDirectory,
+           !FileManager.default.fileExists(atPath: UserPath.expandingTilde(cwd)) {
             return """
             Working directory does not exist:
             \(cwd)
@@ -207,6 +210,7 @@ final class TaskStore {
     private func shouldValidatePathArgument(_ argument: String) -> Bool {
         if argument.isEmpty || argument.hasPrefix("-") { return false }
         if argument.hasPrefix("http://") || argument.hasPrefix("https://") { return false }
+        if argument == "~" || argument.hasPrefix("~/") { return true }
         if argument.hasPrefix("/") { return true }
         return argument.contains("/") && (argument.hasSuffix(".py") || argument.hasSuffix(".sh") || argument.hasSuffix(".js"))
     }
