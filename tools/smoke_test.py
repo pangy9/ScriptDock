@@ -251,12 +251,110 @@ def compile_and_run_detached_writer_test():
         os.kill(pids["keep"], signal.SIGTERM)
 
 
+def compile_and_run_closed_stream_test():
+    """回归测试：子进程关闭输出流但仍存活（如 ssh -N）时，readabilityHandler
+    不得在 EOF 上空读 busy-loop。修复前会跑满一个 CPU 核心。"""
+    with tempfile.TemporaryDirectory(prefix="scriptdock-closestream-") as tmp:
+        tmp_path = Path(tmp)
+        home = tmp_path / "home"
+        support = home / "Library" / "Application Support" / "ScriptDock"
+        support.mkdir(parents=True)
+        config = support / "scripts.json"
+        config.write_text(
+            textwrap.dedent(
+                """
+                {
+                  "tasks": [
+                    {
+                      "id": "close-streams",
+                      "name": "Close Streams",
+                      "programArguments": ["/bin/sh", "-c", "exec 1>&- 2>&-; sleep 5"],
+                      "mode": "daemon"
+                    }
+                  ]
+                }
+                """
+            ).strip()
+        )
+
+        test_main = tmp_path / "ClosedStreamTest.swift"
+        test_main.write_text(
+            textwrap.dedent(
+                """
+                import Darwin
+                import Foundation
+
+                func fail(_ message: String) -> Never {
+                    fputs("\\(message)\\n", stderr)
+                    exit(1)
+                }
+
+                func cpuSeconds(_ r: rusage) -> Double {
+                    Double(r.ru_utime.tv_sec) + Double(r.ru_utime.tv_usec) / 1_000_000
+                        + Double(r.ru_stime.tv_sec) + Double(r.ru_stime.tv_usec) / 1_000_000
+                }
+
+                @main
+                struct ClosedStreamTest {
+                    static func main() {
+                        let store = TaskStore(appSupportURL: URL(fileURLWithPath: "__APP_SUPPORT__"))
+                        try! store.ensureSupportFiles()
+                        _ = store.reload()
+                        let supervisor = Supervisor(store: store)
+                        supervisor.start(autoStart: false, startHTTPServer: false)
+
+                        guard supervisor.startTask(id: "close-streams", source: "test") == nil else {
+                            fail("close-streams should start")
+                        }
+                        // 子进程立即关闭 stdout/stderr -> 读端收到 EOF，进程靠 sleep 维持存活。
+                        // 修复前：readabilityHandler 在 EOF 上空读 busy-loop，单核 ~100%。
+                        // 修复后：EOF 时注销 handler，CPU 约 0。
+                        usleep(300_000)
+
+                        var before = rusage()
+                        getrusage(RUSAGE_SELF, &before)
+                        let wallBefore = Date()
+                        usleep(2_000_000)
+                        var after = rusage()
+                        getrusage(RUSAGE_SELF, &after)
+                        let wall = Date().timeIntervalSince(wallBefore)
+                        let cpu = cpuSeconds(after) - cpuSeconds(before)
+                        let pct = (cpu / wall) * 100
+
+                        if pct > 30 {
+                            fail("readabilityHandler busy-loop: \\(String(format: "%.0f", pct))% CPU over \\(String(format: "%.1f", wall))s (threshold 30%)")
+                        }
+                        supervisor.shutdownForAppQuit(timeout: 1.0)
+                        usleep(500_000)
+                        exit(0)
+                    }
+                }
+                """
+            ).strip().replace("__APP_SUPPORT__", str(support))
+        )
+
+        binary = tmp_path / "ClosedStreamTest"
+        sources = [
+            ROOT / "src/Models.swift",
+            ROOT / "src/TaskStore.swift",
+            ROOT / "src/ProcessRunner.swift",
+            ROOT / "src/PortInspector.swift",
+            ROOT / "src/Supervisor/SupervisorMain.swift",
+            test_main,
+        ]
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        run(["swiftc", *map(str, sources), "-parse-as-library", "-o", str(binary)], env=env)
+        run([str(binary)], env=env)
+
+
 def main():
     if not shutil.which("swiftc"):
         print("swiftc not found", file=sys.stderr)
         return 1
     compile_and_run_supervisor_shutdown_test()
     compile_and_run_detached_writer_test()
+    compile_and_run_closed_stream_test()
     return 0
 
 

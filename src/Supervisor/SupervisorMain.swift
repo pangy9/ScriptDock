@@ -48,11 +48,20 @@ final class RingBuffer {
     }
 }
 
+// 任务状态变化通知 —— 取代 UI 轮询。ManagedTask.state 变化时 post，监听方按需刷新（如 menu bar 标题）。
+extension Notification.Name {
+    static let scriptDockTaskStateChanged = Notification.Name("ScriptDockTaskStateChanged")
+}
+
 // MARK: - Managed Task
 
 final class ManagedTask {
     var config: ScriptTask
-    var state: TaskState = .stopped
+    var state: TaskState = .stopped {
+        didSet {
+            NotificationCenter.default.post(name: .scriptDockTaskStateChanged, object: config.id)
+        }
+    }
     var pid: Int32?
     var exitCode: Int32?
     var startedAt: Date?
@@ -178,7 +187,12 @@ final class ManagedTask {
             // Read stdout into ring buffer + file (with timestamp injection)
             stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
-                guard !data.isEmpty else { return }
+                guard !data.isEmpty else {
+                    // EOF：子进程关闭了该输出流（典型如 ssh -N）。
+                    // 不注销的话 GCD 会持续重派此回调 → 空读 busy-loop 跑满一个核心。
+                    handle.readabilityHandler = nil
+                    return
+                }
                 let tsData = ManagedTask.injectTimestamps(data)
                 self?.stdoutBuffer.append(tsData)
                 self?.stdoutHandle?.write(tsData)
@@ -187,7 +201,11 @@ final class ManagedTask {
             // Read stderr into ring buffer + file (with timestamp injection)
             stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
-                guard !data.isEmpty else { return }
+                guard !data.isEmpty else {
+                    // EOF：同上，必须注销，否则空读 busy-loop。
+                    handle.readabilityHandler = nil
+                    return
+                }
                 let tsData = ManagedTask.injectTimestamps(data)
                 self?.stderrBuffer.append(tsData)
                 self?.stderrHandle?.write(tsData)

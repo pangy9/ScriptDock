@@ -6,14 +6,13 @@ import Foundation
 // MARK: - App Delegate
 
 @main
-final class ScriptDockApp: NSObject, NSApplicationDelegate {
+final class ScriptDockApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private lazy var statusIcon = makeStatusIcon()
     fileprivate let store = TaskStore()
     fileprivate var configErrors: [String: String] = [:]  // taskID -> errorMessage
     private var dashboardController: DashboardWindowController?
     private let selfLaunchAgentLabel = "com.pangyun.ScriptDock.app"
-    private var refreshTimer: Timer?
     private var quickLaunchPanel: QuickLaunchPanel?
     private var globalHotKey: EventHotKeyRef?
     private var hotKeyEventHandler: EventHandlerRef?
@@ -59,8 +58,9 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
         reloadConfig(showAlert: false)
         setupStatusItem()
         registerGlobalHotKey()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.rebuildMenu()
+        // 监听任务状态变化，按需刷新 menu bar 标题（替代原来每 5 秒轮询重建整个菜单）。
+        NotificationCenter.default.addObserver(forName: .scriptDockTaskStateChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.updateStatusTitle()
         }
     }
 
@@ -69,8 +69,6 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
         guard supervisor.hasTasksToStopOnAppQuit() else { return .terminateNow }
 
         isTerminating = true
-        refreshTimer?.invalidate()
-        refreshTimer = nil
         supervisor.shutdownForAppQuit(timeout: 1.0)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.25) {
             sender.reply(toApplicationShouldTerminate: true)
@@ -119,6 +117,9 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
             button.toolTip = "ScriptDock"
             button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         }
+        let menu = NSMenu()
+        menu.delegate = self
+        statusItem?.menu = menu
         rebuildMenu()
     }
 
@@ -158,8 +159,14 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
 
     // MARK: - Menu
 
+    // Menu bar 下拉菜单即将展开时才重建 —— 替代原来每 5 秒无条件重建的定时器；菜单收起时 0 唤醒。
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildMenu()
+    }
+
     private func rebuildMenu() {
-        let menu = NSMenu()
+        guard let menu = statusItem?.menu else { return }
+        menu.removeAllItems()
 
         menu.addItem(NSMenuItem(title: "Open Dashboard", action: #selector(openDashboard), keyEquivalent: "d"))
         menu.addItem(NSMenuItem.separator())
@@ -187,7 +194,6 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "About ScriptDock", action: #selector(showAbout), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
-        statusItem?.menu = menu
         updateStatusTitle()
     }
 
@@ -757,7 +763,7 @@ enum SidebarItem {
     }
 }
 
-final class DashboardWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+final class DashboardWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
     private unowned let app: ScriptDockApp
     private var allTasks: [ScriptTask] = []
     private var sidebarItems: [SidebarItem] = []
@@ -801,12 +807,36 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
         window.title = "ScriptDock"
         window.minSize = NSSize(width: 900, height: 580)
         super.init(window: window)
+        window.delegate = self
         buildInterface()
-        startRefreshTimer()
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        stopRefreshTimer()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        updateRefreshTimerForWindowVisibility()
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        updateRefreshTimerForWindowVisibility()
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        updateRefreshTimerForWindowVisibility()
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        stopRefreshTimer()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        stopRefreshTimer()
     }
 
     func reload() {
@@ -1371,6 +1401,8 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
     // MARK: - Refresh
 
     private func startRefreshTimer() {
+        guard refreshTimer == nil else { return }
+        refreshSupervisorStatuses()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             guard let self, self.window?.isVisible == true else { return }
             self.refreshSupervisorStatuses()
@@ -1404,6 +1436,22 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
             self.updateDetail(refreshLogsOnly: self.liveCheckbox.state == .on)
             self.app.updateStatusTitle()
         }
+    }
+
+    private func stopRefreshTimer() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+    }
+
+    private func updateRefreshTimerForWindowVisibility() {
+        guard let window,
+              window.isVisible,
+              !window.isMiniaturized,
+              window.occlusionState.contains(.visible) else {
+            stopRefreshTimer()
+            return
+        }
+        startRefreshTimer()
     }
 
     private func updateTaskCell(_ cell: NSView, at row: Int) {
