@@ -7,9 +7,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.pangyun.ScriptDock</string>
     <key>CFBundleVersion</key>
-    <string>1.1.5</string>
+    <string>1.1.6</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.5</string>
+    <string>1.1.6</string>
     <key>CFBundleExecutable</key>
     <string>ScriptDock</string>
     <key>CFBundleIconFile</key>
