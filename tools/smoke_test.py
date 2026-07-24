@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import shutil
 import signal
@@ -446,6 +447,237 @@ def compile_and_run_tilde_path_test():
         run([str(binary)])
 
 
+def compile_and_run_retry_lifecycle_test():
+    """Regression test: retry backoff is cancellable and independent from Auto Start."""
+    with tempfile.TemporaryDirectory(prefix="scriptdock-retry-") as tmp:
+        tmp_path = Path(tmp)
+        support = tmp_path / "support"
+        support.mkdir(parents=True)
+        fail_script = tmp_path / "fail.sh"
+        stable_script = tmp_path / "stable-after-retry.sh"
+        auto_counter = tmp_path / "auto-count.txt"
+        retry_counter = tmp_path / "retry-count.txt"
+        stable_counter = tmp_path / "stable-count.txt"
+
+        fail_script.write_text(
+            '#!/bin/sh\nprintf "attempt\\n" >> "$1"\nexit 1\n'
+        )
+        stable_script.write_text(
+            textwrap.dedent(
+                """
+                #!/bin/sh
+                count=0
+                if [ -f "$1" ]; then count=$(wc -l < "$1"); fi
+                printf "attempt\\n" >> "$1"
+                if [ "$count" -gt 0 ]; then sleep 0.25; fi
+                exit 1
+                """
+            ).lstrip()
+        )
+        fail_script.chmod(0o755)
+        stable_script.chmod(0o755)
+
+        config = support / "scripts.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "tasks": [
+                        {
+                            "id": "auto-once",
+                            "name": "Auto Once",
+                            "programArguments": [str(fail_script), str(auto_counter)],
+                            "runAtLoad": True,
+                            "keepAlive": False,
+                            "mode": "daemon",
+                        },
+                        {
+                            "id": "retry-stop",
+                            "name": "Retry Stop",
+                            "programArguments": [str(fail_script), str(retry_counter)],
+                            "runAtLoad": False,
+                            "keepAlive": True,
+                            "mode": "daemon",
+                        },
+                        {
+                            "id": "stable-reset",
+                            "name": "Stable Reset",
+                            "programArguments": [str(stable_script), str(stable_counter)],
+                            "runAtLoad": False,
+                            "keepAlive": True,
+                            "mode": "daemon",
+                        },
+                    ]
+                },
+                indent=2,
+            )
+        )
+
+        test_main = tmp_path / "RetryLifecycleTest.swift"
+        test_main.write_text(
+            textwrap.dedent(
+                """
+                import Darwin
+                import Foundation
+
+                func assertCondition(_ condition: @autoclosure () -> Bool, _ message: String) {
+                    if !condition() {
+                        fputs("Assertion failed: \\(message)\\n", stderr)
+                        exit(1)
+                    }
+                }
+
+                func waitUntil(_ timeout: TimeInterval, _ condition: () -> Bool) -> Bool {
+                    let deadline = Date().addingTimeInterval(timeout)
+                    while Date() < deadline {
+                        if condition() { return true }
+                        usleep(10_000)
+                    }
+                    return condition()
+                }
+
+                func lineCount(_ path: String) -> Int {
+                    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
+                    return text.split(separator: "\\n").count
+                }
+
+                @main
+                struct RetryLifecycleTest {
+                    static func main() {
+                        let policy = RetryPolicy(delays: RetryPolicy.defaultDelays, stableRunThreshold: 60)
+                        let expected: [TimeInterval] = [2, 3, 5, 8, 13, 21, 30, 45, 60, 90, 120, 180, 300, 300]
+                        for (index, delay) in expected.enumerated() {
+                            assertCondition(
+                                policy.delay(forAttempt: index + 1) == delay,
+                                "unexpected production retry delay at attempt \\(index + 1)"
+                            )
+                        }
+
+                        let store = TaskStore(appSupportURL: URL(fileURLWithPath: "__APP_SUPPORT__"))
+                        try! store.ensureSupportFiles()
+                        _ = store.reload()
+                        let supervisor = Supervisor(
+                            store: store,
+                            retryDelays: [0.15, 0.25, 0.35],
+                            stableRunThreshold: 0.2
+                        )
+                        supervisor.start(autoStart: true, startHTTPServer: false)
+
+                        assertCondition(
+                            waitUntil(1.0) { supervisor.taskStatus(id: "auto-once")?.state == .errored },
+                            "Auto Start without Keep Alive should end in errored state"
+                        )
+                        usleep(400_000)
+                        assertCondition(lineCount("__AUTO_COUNTER__") == 1, "Auto Start should launch only once")
+
+                        assertCondition(supervisor.startTask(id: "retry-stop", source: "test") == nil, "retry-stop should start")
+                        assertCondition(
+                            waitUntil(1.0) {
+                                let status = supervisor.taskStatus(id: "retry-stop")
+                                return status?.state == .retrying && status?.retryAttempt == 1
+                            },
+                            "first failure should schedule retry attempt 1"
+                        )
+                        assertCondition(
+                            waitUntil(1.0) {
+                                let status = supervisor.taskStatus(id: "retry-stop")
+                                return status?.state == .retrying && status?.retryAttempt == 2
+                            },
+                            "second failure should schedule retry attempt 2"
+                        )
+
+                        if let status = supervisor.taskStatus(id: "retry-stop") {
+                            let encoder = JSONEncoder()
+                            encoder.dateEncodingStrategy = .iso8601
+                            let data = try! encoder.encode(status)
+                            let decoder = JSONDecoder()
+                            decoder.dateDecodingStrategy = .iso8601
+                            let decoded = try! decoder.decode(TaskStatus.self, from: data)
+                            assertCondition(decoded.state == .retrying, "retrying state should round-trip")
+                            assertCondition(decoded.retryAttempt == 2, "retry attempt should round-trip")
+                            assertCondition(decoded.nextRetryAt != nil, "next retry date should round-trip")
+                        } else {
+                            assertCondition(false, "retry-stop status should exist")
+                        }
+
+                        let attemptsBeforeStop = lineCount("__RETRY_COUNTER__")
+                        assertCondition(supervisor.stopTask(id: "retry-stop") == nil, "Stop should cancel pending retry")
+                        usleep(450_000)
+                        assertCondition(
+                            supervisor.taskStatus(id: "retry-stop")?.state == .stopped,
+                            "stopped retry task should remain stopped"
+                        )
+                        assertCondition(
+                            lineCount("__RETRY_COUNTER__") == attemptsBeforeStop,
+                            "Stop during retry delay must prevent another launch"
+                        )
+
+                        assertCondition(supervisor.startTask(id: "stable-reset", source: "test") == nil, "stable-reset should start")
+                        assertCondition(
+                            waitUntil(2.0) {
+                                lineCount("__STABLE_COUNTER__") >= 2
+                                    && supervisor.taskStatus(id: "stable-reset")?.state == .retrying
+                            },
+                            "stable-reset should complete a failed run and a stable run"
+                        )
+                        assertCondition(
+                            supervisor.taskStatus(id: "stable-reset")?.retryAttempt == 1,
+                            "a stable run should reset backoff to attempt 1"
+                        )
+
+                        let stableAttemptsBeforeConfigChange = lineCount("__STABLE_COUNTER__")
+                        var stableTask = store.task(byID: "stable-reset")!
+                        stableTask.keepAlive = false
+                        try! store.addOrUpdateTask(stableTask)
+                        supervisor.syncTasks()
+                        usleep(250_000)
+                        assertCondition(
+                            supervisor.taskStatus(id: "stable-reset")?.state == .errored,
+                            "disabling Keep Alive should cancel a pending retry"
+                        )
+                        assertCondition(
+                            lineCount("__STABLE_COUNTER__") == stableAttemptsBeforeConfigChange,
+                            "config reload cancellation must prevent another launch"
+                        )
+
+                        stableTask.keepAlive = true
+                        try! store.addOrUpdateTask(stableTask)
+                        supervisor.syncTasks()
+                        assertCondition(supervisor.startTask(id: "stable-reset", source: "test") == nil, "stable-reset should restart")
+                        assertCondition(
+                            waitUntil(1.0) { supervisor.taskStatus(id: "stable-reset")?.state == .retrying },
+                            "stable-reset should enter retrying before shutdown"
+                        )
+                        let stableAttemptsBeforeShutdown = lineCount("__STABLE_COUNTER__")
+                        supervisor.shutdownForAppQuit(timeout: 0.1)
+                        usleep(250_000)
+                        assertCondition(
+                            lineCount("__STABLE_COUNTER__") == stableAttemptsBeforeShutdown,
+                            "app shutdown should cancel pending retries"
+                        )
+                        exit(0)
+                    }
+                }
+                """
+            ).strip()
+            .replace("__APP_SUPPORT__", str(support))
+            .replace("__AUTO_COUNTER__", str(auto_counter))
+            .replace("__RETRY_COUNTER__", str(retry_counter))
+            .replace("__STABLE_COUNTER__", str(stable_counter))
+        )
+
+        binary = tmp_path / "RetryLifecycleTest"
+        sources = [
+            ROOT / "src/Models.swift",
+            ROOT / "src/TaskStore.swift",
+            ROOT / "src/ProcessRunner.swift",
+            ROOT / "src/PortInspector.swift",
+            ROOT / "src/Supervisor/SupervisorMain.swift",
+            test_main,
+        ]
+        run(["swiftc", *map(str, sources), "-parse-as-library", "-o", str(binary)])
+        run([str(binary)])
+
+
 def main():
     if not shutil.which("swiftc"):
         print("swiftc not found", file=sys.stderr)
@@ -454,6 +686,7 @@ def main():
     compile_and_run_detached_writer_test()
     compile_and_run_closed_stream_test()
     compile_and_run_tilde_path_test()
+    compile_and_run_retry_lifecycle_test()
     return 0
 
 

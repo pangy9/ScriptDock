@@ -59,7 +59,10 @@ final class ManagedTask {
     var config: ScriptTask
     var state: TaskState = .stopped {
         didSet {
-            NotificationCenter.default.post(name: .scriptDockTaskStateChanged, object: config.id)
+            let taskID = config.id
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .scriptDockTaskStateChanged, object: taskID)
+            }
         }
     }
     var pid: Int32?
@@ -68,6 +71,12 @@ final class ManagedTask {
     var lastError: String?
     var startedBy: String?
     var stoppedManually = false
+    var retryAttempt = 0
+    var nextRetryAt: Date?
+    var pendingRetry: DispatchWorkItem?
+    var retryGeneration: UInt = 0
+    var restartRequested = false
+    var restartSource: String?
     let stdoutBuffer = RingBuffer()
     let stderrBuffer = RingBuffer()
     private var process: Process?
@@ -127,14 +136,20 @@ final class ManagedTask {
             lastError: lastError,
             ports: config.ports,
             runningDuration: duration,
-            startedBy: startedBy
+            startedBy: startedBy,
+            retryAttempt: state == .retrying ? retryAttempt : nil,
+            nextRetryAt: state == .retrying ? nextRetryAt : nil
         )
     }
 
-    func start(logsURL: URL, source: String? = nil, extraArgs: [String]? = nil, onExit: @escaping (ManagedTask) -> Void) throws {
+    func start(
+        logsURL: URL,
+        source: String? = nil,
+        extraArgs: [String]? = nil,
+        onExit: @escaping (ManagedTask, Int32) -> Void
+    ) throws {
         guard state != .running else { return }
         self.startedBy = source
-        self.stoppedManually = false
 
         // Clear buffers and files for a fresh run
         stdoutBuffer.clear()
@@ -215,22 +230,18 @@ final class ManagedTask {
             }
         }
 
-        process.terminationHandler = { [weak self] _ in
+        process.terminationHandler = { [weak self] process in
             guard let self else { return }
-            self.pid = nil
-            self.exitCode = process.terminationStatus
-            self.state = process.terminationStatus == 0 ? .stopped : .errored
-            if process.terminationStatus != 0 {
-                self.lastError = "Exited with code \(process.terminationStatus)"
-            }
-            self.stdoutPipe?.fileHandleForReading.readabilityHandler = nil
-            self.stderrPipe?.fileHandleForReading.readabilityHandler = nil
-            try? self.stdoutHandle?.close()
-            try? self.stderrHandle?.close()
-            onExit(self)
+            onExit(self, process.terminationStatus)
         }
 
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            cleanupProcessResources()
+            self.process = nil
+            throw error
+        }
         self.pid = process.processIdentifier
         self.state = .running
         self.startedAt = Date()
@@ -238,18 +249,34 @@ final class ManagedTask {
         self.exitCode = nil
     }
 
-    func stop(timeout: TimeInterval = 5.0) {
-        guard let process, state == .running else { return }
-        stoppedManually = true
-        process.interrupt()
-        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
-            guard let self, self.state == .running else { return }
-            self.process?.terminate()
-        }
+    func completeExit(status: Int32) -> TimeInterval {
+        let runtime = startedAt.map { Date().timeIntervalSince($0) } ?? 0
+        pid = nil
+        exitCode = status
+        lastError = status == 0 ? nil : "Exited with code \(status)"
+        startedAt = nil
+        process = nil
+        cleanupProcessResources()
+        return runtime
+    }
+
+    func interrupt() {
+        process?.interrupt()
     }
 
     func terminate() {
         process?.terminate()
+    }
+
+    private func cleanupProcessResources() {
+        stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        try? stdoutHandle?.close()
+        try? stderrHandle?.close()
+        stdoutPipe = nil
+        stderrPipe = nil
+        stdoutHandle = nil
+        stderrHandle = nil
     }
 
     var shouldStopOnAppQuit: Bool {
@@ -259,135 +286,208 @@ final class ManagedTask {
 
 // MARK: - Supervisor
 
+struct RetryPolicy {
+    static let defaultDelays: [TimeInterval] = [2, 3, 5, 8, 13, 21, 30, 45, 60, 90, 120, 180, 300]
+
+    let delays: [TimeInterval]
+    let stableRunThreshold: TimeInterval
+
+    func delay(forAttempt attempt: Int) -> TimeInterval {
+        guard !delays.isEmpty else { return 60 }
+        let index = max(0, min(attempt - 1, delays.count - 1))
+        return delays[index]
+    }
+}
+
 final class Supervisor {
     private let store: TaskStore
     private var managedTasks: [String: ManagedTask] = [:]
     private var httpServer: HTTPServer?
     private let eventListeners = NSMutableSet()
+    private let retryPolicy: RetryPolicy
+    private let controlQueue = DispatchQueue(label: "com.pangyun.ScriptDock.supervisor")
+    private let controlQueueKey = DispatchSpecificKey<Void>()
+    private var isShuttingDown = false
 
-    init(store: TaskStore) {
+    init(
+        store: TaskStore,
+        retryDelays: [TimeInterval] = RetryPolicy.defaultDelays,
+        stableRunThreshold: TimeInterval = 60
+    ) {
         self.store = store
+        self.retryPolicy = RetryPolicy(
+            delays: retryDelays,
+            stableRunThreshold: stableRunThreshold
+        )
+        controlQueue.setSpecific(key: controlQueueKey, value: ())
     }
 
     func start(autoStart: Bool = true, startHTTPServer: Bool = true) {
-        let result = store.reload()
-        for task in result.tasks {
-            let managed = ManagedTask(config: task)
-            managedTasks[task.id] = managed
-            if autoStart && task.runAtLoad == true {
-                _ = startTask(id: task.id, source: "auto")
+        var serverToStart: HTTPServer?
+        withControlQueue {
+            isShuttingDown = false
+            let result = store.reload()
+            for task in result.tasks {
+                let managed = ManagedTask(config: task)
+                managedTasks[task.id] = managed
+                if autoStart && task.runAtLoad == true {
+                    _ = startTaskLocked(id: task.id, source: "auto", extraArgs: nil)
+                }
+            }
+
+            if startHTTPServer {
+                let server = HTTPServer(supervisor: self)
+                httpServer = server
+                serverToStart = server
             }
         }
-
-        if startHTTPServer {
-            httpServer = HTTPServer(supervisor: self)
-            httpServer?.start()
-        }
+        serverToStart?.start()
     }
 
     func taskIDs() -> [String] {
-        store.tasks.map(\.id)
+        withControlQueue {
+            store.tasks.map(\.id)
+        }
     }
 
     func taskStatus(id: String) -> TaskStatus? {
-        managedTasks[id]?.status
+        withControlQueue {
+            managedTasks[id]?.status
+        }
     }
 
     func allStatuses() -> [TaskStatus] {
-        store.tasks.compactMap { managedTasks[$0.id]?.status }
+        withControlQueue {
+            store.tasks.compactMap { managedTasks[$0.id]?.status }
+        }
     }
 
     func hasTasksToStopOnAppQuit() -> Bool {
-        managedTasks.values.contains { $0.shouldStopOnAppQuit }
+        withControlQueue {
+            managedTasks.values.contains { $0.shouldStopOnAppQuit }
+        }
     }
 
     func startTask(id: String, source: String? = nil, extraArgs: [String]? = nil) -> String? {
+        withControlQueue {
+            startTaskLocked(id: id, source: source, extraArgs: extraArgs)
+        }
+    }
+
+    private func startTaskLocked(id: String, source: String?, extraArgs: [String]?) -> String? {
         guard let managed = managedTasks[id] else { return "Task not found: \(id)" }
+        guard !isShuttingDown else { return "ScriptDock is shutting down" }
+        guard managed.state != .running else { return nil }
+
+        cancelPendingRetryLocked(managed)
+        managed.retryAttempt = 0
+        managed.stoppedManually = false
+        managed.restartRequested = false
+        managed.restartSource = nil
+        return launchTaskLocked(managed, source: source, extraArgs: extraArgs)
+    }
+
+    private func launchTaskLocked(_ managed: ManagedTask, source: String?, extraArgs: [String]? = nil) -> String? {
         do {
-            try managed.start(logsURL: store.logsURL, source: source, extraArgs: extraArgs) { [weak self] task in
-                self?.handleTaskExit(task)
+            try managed.start(logsURL: store.logsURL, source: source, extraArgs: extraArgs) { [weak self] task, status in
+                guard let self else { return }
+                self.controlQueue.async {
+                    self.handleTaskExitLocked(task, status: status)
+                }
             }
             return nil
         } catch {
-            managed.state = .errored
             managed.lastError = error.localizedDescription
+            managed.exitCode = nil
+            if managed.config.keepAlive == true && !managed.stoppedManually && !isShuttingDown {
+                scheduleRetryLocked(managed)
+            } else {
+                managed.state = .errored
+            }
             return error.localizedDescription
         }
     }
 
     func stopTask(id: String) -> String? {
-        guard let managed = managedTasks[id] else { return "Task not found: \(id)" }
-        managed.stop()
-        return nil
+        withControlQueue {
+            stopTaskLocked(id: id)
+        }
     }
 
-    func restartTask(id: String, source: String? = nil) -> String? {
+    private func stopTaskLocked(id: String, timeout: TimeInterval = 5.0) -> String? {
         guard let managed = managedTasks[id] else { return "Task not found: \(id)" }
-        managed.stop()
-        // Wait briefly for stop, then start
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            _ = self?.startTask(id: id, source: source)
+        cancelPendingRetryLocked(managed)
+        managed.restartRequested = false
+        managed.restartSource = nil
+        managed.stoppedManually = true
+        managed.retryAttempt = 0
+
+        if managed.state == .running {
+            interruptLocked(managed, timeout: timeout)
+        } else {
+            managed.nextRetryAt = nil
+            managed.state = .stopped
         }
         return nil
     }
 
+    func restartTask(id: String, source: String? = nil) -> String? {
+        withControlQueue {
+            restartTaskLocked(id: id, source: source)
+        }
+    }
+
+    private func restartTaskLocked(id: String, source: String?) -> String? {
+        guard let managed = managedTasks[id] else { return "Task not found: \(id)" }
+        guard !isShuttingDown else { return "ScriptDock is shutting down" }
+
+        cancelPendingRetryLocked(managed)
+        managed.retryAttempt = 0
+        if managed.state == .running {
+            managed.restartRequested = true
+            managed.restartSource = source
+            managed.stoppedManually = true
+            interruptLocked(managed, timeout: 5.0)
+            return nil
+        }
+
+        managed.stoppedManually = false
+        managed.restartRequested = false
+        managed.restartSource = nil
+        return launchTaskLocked(managed, source: source)
+    }
+
     func readLogs(id: String, stream: LogStream, since offset: Int) -> (data: Data, total: Int)? {
-        guard let managed = managedTasks[id] else { return nil }
-        let buffer = stream == .stdout ? managed.stdoutBuffer : managed.stderrBuffer
-        let data = buffer.read(since: offset)
-        return (data, buffer.count)
+        withControlQueue {
+            guard let managed = managedTasks[id] else { return nil }
+            let buffer = stream == .stdout ? managed.stdoutBuffer : managed.stderrBuffer
+            let data = buffer.read(since: offset)
+            return (data, buffer.count)
+        }
     }
 
     func clearLogs(id: String) {
-        guard let managed = managedTasks[id] else { return }
-        managed.stdoutBuffer.clear()
-        managed.stderrBuffer.clear()
+        withControlQueue {
+            guard let managed = managedTasks[id] else { return }
+            managed.stdoutBuffer.clear()
+            managed.stderrBuffer.clear()
+        }
     }
 
     /// Sync managed tasks with the store's task list (called after config reload).
     /// Does not call store.reload() — the caller should do that first.
     func syncTasks() {
-        let currentIDs = Set(store.tasks.map(\.id))
-        for id in managedTasks.keys where !currentIDs.contains(id) {
-            managedTasks[id]?.terminate()
-            managedTasks.removeValue(forKey: id)
-        }
-        for task in store.tasks {
-            if let existing = managedTasks[task.id] {
-                // Only update config when stopped — don't mutate a running task
-                if existing.state == .stopped || existing.state == .errored {
-                    existing.config = task
-                }
-            } else {
-                managedTasks[task.id] = ManagedTask(config: task)
-            }
+        withControlQueue {
+            syncTasksLocked(store.tasks)
         }
     }
 
     func reloadConfig() -> [String] {
-        let result = store.reload()
-        let errors = result.errors
-
-        // Remove tasks no longer in config
-        let currentIDs = Set(result.tasks.map(\.id))
-        for id in managedTasks.keys where !currentIDs.contains(id) {
-            managedTasks[id]?.terminate()
-            managedTasks.removeValue(forKey: id)
+        withControlQueue {
+            let result = store.reload()
+            syncTasksLocked(result.tasks)
+            return Array(result.errors.values)
         }
-
-        // Add new tasks, update existing
-        for task in result.tasks {
-            if let existing = managedTasks[task.id] {
-                // Only update config when stopped — don't mutate a running task
-                if existing.state == .stopped || existing.state == .errored {
-                    existing.config = task
-                }
-            } else {
-                managedTasks[task.id] = ManagedTask(config: task)
-            }
-        }
-
-        return Array(errors.values)
     }
 
     func portCheck(ports: [Int]) -> [PortOwner] {
@@ -399,18 +499,152 @@ final class Supervisor {
     }
 
     func shutdownForAppQuit(timeout: TimeInterval = 1.0) {
-        for managed in managedTasks.values where managed.shouldStopOnAppQuit {
-            managed.stop(timeout: timeout)
+        withControlQueue {
+            isShuttingDown = true
+            for managed in managedTasks.values {
+                cancelPendingRetryLocked(managed)
+                managed.restartRequested = false
+                managed.restartSource = nil
+                if managed.state == .retrying {
+                    managed.state = .stopped
+                }
+                if managed.shouldStopOnAppQuit {
+                    managed.stoppedManually = true
+                    interruptLocked(managed, timeout: timeout)
+                }
+            }
         }
     }
 
-    private func handleTaskExit(_ task: ManagedTask) {
-        // Auto-restart daemon tasks unless explicitly stopped
-        if task.config.effectiveMode == .daemon && !task.stoppedManually {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                _ = self?.startTask(id: task.config.id)
+    func cancelPendingRetriesForAppQuit() {
+        withControlQueue {
+            isShuttingDown = true
+            for managed in managedTasks.values {
+                cancelPendingRetryLocked(managed)
+                managed.restartRequested = false
+                managed.restartSource = nil
+                if managed.state == .retrying {
+                    managed.state = .stopped
+                }
             }
         }
+    }
+
+    private func handleTaskExitLocked(_ task: ManagedTask, status: Int32) {
+        guard managedTasks[task.config.id] === task else { return }
+        let runtime = task.completeExit(status: status)
+
+        if task.restartRequested && !isShuttingDown {
+            let source = task.restartSource
+            task.restartRequested = false
+            task.restartSource = nil
+            task.stoppedManually = false
+            task.retryAttempt = 0
+            _ = launchTaskLocked(task, source: source)
+            return
+        }
+
+        guard !task.stoppedManually && !isShuttingDown else {
+            task.state = .stopped
+            return
+        }
+
+        if task.config.keepAlive == true {
+            if runtime >= retryPolicy.stableRunThreshold {
+                task.retryAttempt = 0
+            }
+            scheduleRetryLocked(task)
+        } else {
+            task.state = status == 0 ? .stopped : .errored
+        }
+    }
+
+    private func scheduleRetryLocked(_ task: ManagedTask) {
+        guard task.config.keepAlive == true,
+              !task.stoppedManually,
+              !isShuttingDown,
+              managedTasks[task.config.id] === task else {
+            task.state = task.exitCode == 0 ? .stopped : .errored
+            return
+        }
+
+        cancelPendingRetryLocked(task)
+        task.retryAttempt += 1
+        let delay = retryPolicy.delay(forAttempt: task.retryAttempt)
+        task.nextRetryAt = Date().addingTimeInterval(delay)
+        task.retryGeneration &+= 1
+        let generation = task.retryGeneration
+        let taskID = task.config.id
+        let source = task.startedBy
+
+        let workItem = DispatchWorkItem { [weak self, weak task] in
+            guard let self, let task,
+                  task.retryGeneration == generation,
+                  self.managedTasks[taskID] === task,
+                  task.config.keepAlive == true,
+                  !task.stoppedManually,
+                  !self.isShuttingDown else {
+                return
+            }
+            task.pendingRetry = nil
+            task.nextRetryAt = nil
+            _ = self.launchTaskLocked(task, source: source)
+        }
+        task.pendingRetry = workItem
+        task.state = .retrying
+        controlQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func cancelPendingRetryLocked(_ task: ManagedTask) {
+        task.pendingRetry?.cancel()
+        task.pendingRetry = nil
+        task.nextRetryAt = nil
+        task.retryGeneration &+= 1
+    }
+
+    private func interruptLocked(_ task: ManagedTask, timeout: TimeInterval) {
+        let expectedPID = task.pid
+        task.interrupt()
+        controlQueue.asyncAfter(deadline: .now() + timeout) { [weak self, weak task] in
+            guard let self, let task,
+                  self.managedTasks[task.config.id] === task,
+                  task.state == .running,
+                  task.pid == expectedPID else {
+                return
+            }
+            task.terminate()
+        }
+    }
+
+    private func syncTasksLocked(_ tasks: [ScriptTask]) {
+        let currentIDs = Set(tasks.map(\.id))
+        for id in Array(managedTasks.keys) where !currentIDs.contains(id) {
+            guard let managed = managedTasks.removeValue(forKey: id) else { continue }
+            cancelPendingRetryLocked(managed)
+            managed.stoppedManually = true
+            managed.restartRequested = false
+            managed.terminate()
+        }
+
+        for task in tasks {
+            if let existing = managedTasks[task.id] {
+                existing.config = task
+                if task.keepAlive != true && existing.state == .retrying {
+                    cancelPendingRetryLocked(existing)
+                    existing.retryAttempt = 0
+                    existing.state = existing.exitCode == 0 ? .stopped : .errored
+                }
+            } else {
+                managedTasks[task.id] = ManagedTask(config: task)
+            }
+        }
+    }
+
+    private func withControlQueue<T>(_ operation: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: controlQueueKey) != nil {
+            return operation()
+        }
+        return controlQueue.sync(execute: operation)
     }
 }
 
@@ -419,6 +653,7 @@ final class Supervisor {
 final class HTTPServer {
     private let supervisor: Supervisor
     private var serverSocket: Int32 = -1
+    private var serverSource: DispatchSourceRead?
 
     init(supervisor: Supervisor) {
         self.supervisor = supervisor
@@ -457,6 +692,7 @@ final class HTTPServer {
         source.setEventHandler { [weak self] in
             self?.acceptConnection()
         }
+        serverSource = source
         source.resume()
 
         print("HTTP API listening on http://127.0.0.1:26216")

@@ -16,8 +16,14 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var quickLaunchPanel: QuickLaunchPanel?
     private var globalHotKey: EventHotKeyRef?
     private var hotKeyEventHandler: EventHandlerRef?
+    private var menuRefreshTimer: Timer?
+    private var isStatusMenuOpen = false
+    private var taskMenuItems: [String: NSMenuItem] = [:]
+    private var taskStatusMenuItems: [String: NSMenuItem] = [:]
+    private var pendingStatusTitleUpdates: [String: DispatchWorkItem] = [:]
     private var isTerminating = false
     private(set) var supervisor: Supervisor!
+    private let statusCountQualification: TimeInterval = 2
 
     static func main() {
         // 单实例保护：抢独占文件锁。已有实例持锁 → 静默退出，根治双进程
@@ -59,13 +65,19 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupStatusItem()
         registerGlobalHotKey()
         // 监听任务状态变化，按需刷新 menu bar 标题（替代原来每 5 秒轮询重建整个菜单）。
-        NotificationCenter.default.addObserver(forName: .scriptDockTaskStateChanged, object: nil, queue: .main) { [weak self] _ in
-            self?.updateStatusTitle()
+        NotificationCenter.default.addObserver(forName: .scriptDockTaskStateChanged, object: nil, queue: .main) { [weak self] notification in
+            self?.handleTaskStateChange(taskID: notification.object as? String)
         }
+        scheduleStatusTitleRefresh(after: statusCountQualification)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isTerminating else { return .terminateNow }
+        menuRefreshTimer?.invalidate()
+        menuRefreshTimer = nil
+        pendingStatusTitleUpdates.values.forEach { $0.cancel() }
+        pendingStatusTitleUpdates.removeAll()
+        supervisor.cancelPendingRetriesForAppQuit()
         guard supervisor.hasTasksToStopOnAppQuit() else { return .terminateNow }
 
         isTerminating = true
@@ -164,9 +176,28 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
+    func menuWillOpen(_ menu: NSMenu) {
+        isStatusMenuOpen = true
+        updateOpenMenuStatuses()
+        menuRefreshTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.updateOpenMenuStatuses()
+        }
+        menuRefreshTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isStatusMenuOpen = false
+        menuRefreshTimer?.invalidate()
+        menuRefreshTimer = nil
+    }
+
     private func rebuildMenu() {
         guard let menu = statusItem?.menu else { return }
         menu.removeAllItems()
+        taskMenuItems.removeAll(keepingCapacity: true)
+        taskStatusMenuItems.removeAll(keepingCapacity: true)
 
         menu.addItem(NSMenuItem(title: "Open Dashboard", action: #selector(openDashboard), keyEquivalent: "d"))
         menu.addItem(NSMenuItem.separator())
@@ -198,13 +229,28 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func addTask(_ task: ScriptTask, to menu: NSMenu) {
-        let running = isRunning(task)
-        let taskItem = NSMenuItem(title: "\(running ? "●" : "○") \(task.name)", action: nil, keyEquivalent: "")
+        let taskStatus = status(for: task)
+        let running = taskStatus?.state == .running
+        let retrying = taskStatus?.state == .retrying
+        let prefix = running ? "●" : (retrying ? "↻" : "○")
+        let taskItem = NSMenuItem(title: "\(prefix) \(task.name)", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
 
-        let status = NSMenuItem(title: running ? "Running" : "Stopped", action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        submenu.addItem(status)
+        let statusTitle: String
+        if let taskStatus, retrying {
+            statusTitle = retryDescription(taskStatus)
+        } else if running {
+            statusTitle = "Running"
+        } else if taskStatus?.state == .errored {
+            statusTitle = "Error"
+        } else {
+            statusTitle = "Stopped"
+        }
+        let statusItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
+        statusItem.isEnabled = false
+        submenu.addItem(statusItem)
+        taskMenuItems[task.id] = taskItem
+        taskStatusMenuItems[task.id] = statusItem
         submenu.addItem(NSMenuItem.separator())
 
         submenu.addItem(menuItem("Start", action: #selector(startTask(_:)), task: task))
@@ -403,8 +449,27 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configErrors[task.id]
     }
 
+    fileprivate func status(for task: ScriptTask) -> TaskStatus? {
+        supervisor.taskStatus(id: task.id)
+    }
+
     fileprivate func isRunning(_ task: ScriptTask) -> Bool {
-        supervisor.taskStatus(id: task.id)?.state == .running
+        status(for: task)?.state == .running
+    }
+
+    fileprivate func isRetrying(_ task: ScriptTask) -> Bool {
+        status(for: task)?.state == .retrying
+    }
+
+    fileprivate func isActive(_ task: ScriptTask) -> Bool {
+        guard let state = status(for: task)?.state else { return false }
+        return state == .running || state == .retrying
+    }
+
+    fileprivate func retryDescription(_ status: TaskStatus) -> String {
+        let seconds = max(0, Int(ceil(status.nextRetryAt?.timeIntervalSinceNow ?? 0)))
+        let attempt = status.retryAttempt ?? 1
+        return "Retrying in \(seconds)s (attempt \(attempt))"
     }
 
     fileprivate func pid(for task: ScriptTask) -> Int32? {
@@ -510,7 +575,7 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return }
             self.rebuildMenu()
             self.dashboardController?.reload()
-            if self.isRunning(task) { return }
+            if self.isActive(task) { return }
 
             // One-shot tasks are expected to exit quickly — not an error
             if task.effectiveMode == .oneshot { return }
@@ -587,8 +652,66 @@ final class ScriptDockApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Helpers
 
     fileprivate func updateStatusTitle() {
-        let running = store.tasks.filter { isRunning($0) }.count
-        statusItem?.button?.title = running > 0 ? " \(running)" : ""
+        let qualifiedRunning = store.tasks.filter { task in
+            guard let status = status(for: task), status.state == .running else { return false }
+            return (status.runningDuration ?? 0) >= statusCountQualification
+        }.count
+        statusItem?.button?.title = qualifiedRunning > 0 ? " \(qualifiedRunning)" : ""
+    }
+
+    private func handleTaskStateChange(taskID: String?) {
+        updateStatusTitle()
+        updateOpenMenuStatuses()
+
+        guard let taskID,
+              let task = store.task(byID: taskID),
+              status(for: task)?.state == .running else {
+            if let taskID {
+                pendingStatusTitleUpdates.removeValue(forKey: taskID)?.cancel()
+            }
+            return
+        }
+
+        pendingStatusTitleUpdates.removeValue(forKey: taskID)?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.pendingStatusTitleUpdates.removeValue(forKey: taskID)
+            self?.updateStatusTitle()
+            self?.updateOpenMenuStatuses()
+        }
+        pendingStatusTitleUpdates[taskID] = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + statusCountQualification, execute: workItem)
+    }
+
+    private func scheduleStatusTitleRefresh(after delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.updateStatusTitle()
+        }
+    }
+
+    private func updateOpenMenuStatuses() {
+        guard isStatusMenuOpen else { return }
+        for task in store.tasks {
+            guard let taskItem = taskMenuItems[task.id],
+                  let statusItem = taskStatusMenuItems[task.id] else {
+                continue
+            }
+
+            let taskStatus = status(for: task)
+            switch taskStatus?.state {
+            case .running:
+                taskItem.title = "● \(task.name)"
+                statusItem.title = "Running"
+            case .retrying:
+                taskItem.title = "↻ \(task.name)"
+                statusItem.title = taskStatus.map(retryDescription) ?? "Retrying"
+            case .errored:
+                taskItem.title = "○ \(task.name)"
+                statusItem.title = "Error"
+            default:
+                taskItem.title = "○ \(task.name)"
+                statusItem.title = "Stopped"
+            }
+        }
     }
 
     private func selfLaunchAgentURL() -> URL {
@@ -773,6 +896,8 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
     private var selectedTaskID: String?
     private var logStreamMode: Int = 0  // 0=combined, 1=stdout, 2=stderr
     private var refreshTimer: Timer?
+    private var retryCountdownTimer: Timer?
+    private weak var retryStatusLabel: NSTextField?
     private var userScrolledUp = false
     private var currentEditor: TaskEditorWindowController?
 
@@ -1341,7 +1466,8 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
         let supervisorStatuses = cachedSupervisorStatuses
 
         let running = all.filter { app.isRunning($0) && app.taskError(for: $0) == nil }
-        let stopped = all.filter { !app.isRunning($0) && app.taskError(for: $0) == nil }
+        let retrying = all.filter { app.isRetrying($0) && app.taskError(for: $0) == nil }
+        let stopped = all.filter { !app.isActive($0) && app.taskError(for: $0) == nil }
         let broken = all.filter { app.taskError(for: $0) != nil }
 
         // Split running into AI (started via MCP) and manual
@@ -1367,6 +1493,14 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
             items.append(.header(headerTitle))
             if !collapsedSections.contains(headerTitle) {
                 items.append(contentsOf: aiRunning.map { .task($0) })
+            }
+        }
+
+        if !retrying.isEmpty {
+            let headerTitle = "Retrying (\(retrying.count))"
+            items.append(.header(headerTitle))
+            if !collapsedSections.contains(headerTitle) {
+                items.append(contentsOf: retrying.map { .task($0) })
             }
         }
 
@@ -1402,6 +1536,7 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
     // MARK: - Refresh
 
     private func startRefreshTimer() {
+        startRetryCountdownTimer()
         guard refreshTimer == nil else { return }
         refreshSupervisorStatuses()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
@@ -1439,9 +1574,21 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
         }
     }
 
+    private func startRetryCountdownTimer() {
+        guard retryCountdownTimer == nil else { return }
+        updateRetryCountdownDisplay()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.updateRetryCountdownDisplay()
+        }
+        retryCountdownTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
     private func stopRefreshTimer() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        retryCountdownTimer?.invalidate()
+        retryCountdownTimer = nil
     }
 
     private func updateRefreshTimerForWindowVisibility() {
@@ -1457,7 +1604,10 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
 
     private func updateTaskCell(_ cell: NSView, at row: Int) {
         guard row < sidebarItems.count, case .task(let task) = sidebarItems[row] else { return }
-        let running = app.isRunning(task)
+        let taskStatus = app.status(for: task)
+        let running = taskStatus?.state == .running
+        let retrying = taskStatus?.state == .retrying
+        let active = running || retrying
         let error = app.taskError(for: task)
 
         guard let toggleBtn = cell.viewWithTag(100) as? NSButton,
@@ -1473,15 +1623,21 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
             nameField.textColor = .systemRed
             restartBtn.isHidden = true
         } else {
-            let toggleIcon = running
+            let toggleIcon = active
                 ? NSImage(systemSymbolName: "stop.fill", accessibilityDescription: "Stop")
                 : NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Start")
             toggleBtn.image = toggleIcon
-            toggleBtn.contentTintColor = running ? .systemOrange : .systemGreen
-            toggleBtn.toolTip = running ? "Stop \(task.name)" : "Start \(task.name)"
-            nameField.stringValue = "\(running ? "● " : "○ ")\(task.name)"
-            nameField.textColor = running ? .textColor : .secondaryLabelColor
-            restartBtn.isHidden = !running
+            toggleBtn.contentTintColor = active ? .systemOrange : .systemGreen
+            if let taskStatus, retrying {
+                toggleBtn.toolTip = "Cancel \(app.retryDescription(taskStatus))"
+                nameField.stringValue = "↻ \(task.name)"
+                nameField.textColor = .systemOrange
+            } else {
+                toggleBtn.toolTip = running ? "Stop \(task.name)" : "Start \(task.name)"
+                nameField.stringValue = "\(running ? "● " : "○ ")\(task.name)"
+                nameField.textColor = running ? .textColor : .secondaryLabelColor
+            }
+            restartBtn.isHidden = !active
         }
     }
 
@@ -1493,27 +1649,43 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
             commandLabel.stringValue = ""
             portTextView.string = ""
             setLogText("")
+            retryStatusLabel = nil
             badgeStack.arrangedSubviews.forEach { badgeStack.removeView($0) }
             return
         }
         if !refreshLogsOnly {
             titleLabel.stringValue = task.name
-            let running = app.isRunning(task)
-            let taskPid = app.pid(for: task)
+            let taskStatus = app.status(for: task)
+            let running = taskStatus?.state == .running
+            let retrying = taskStatus?.state == .retrying
+            let taskPid = taskStatus?.pid
             let ports = app.inferredPorts(for: task)
             let configError = app.taskError(for: task)
 
             // Build badge bar
+            retryStatusLabel = nil
             badgeStack.arrangedSubviews.forEach { badgeStack.removeView($0) }
             if configError != nil {
                 // Broken task: show error badge
                 badgeStack.addArrangedSubview(badgeLabel("⚠ Config Error", color: .systemRed))
             } else {
-                let statusBadge = badgeLabel(
-                    running ? "● Running" : "○ Stopped",
-                    color: running ? NSColor.systemGreen : NSColor.tertiaryLabelColor
-                )
+                let statusText: String
+                let statusColor: NSColor
+                if let taskStatus, retrying {
+                    statusText = "↻ \(app.retryDescription(taskStatus))"
+                    statusColor = .systemOrange
+                } else if running {
+                    statusText = "● Running"
+                    statusColor = .systemGreen
+                } else {
+                    statusText = "○ Stopped"
+                    statusColor = .tertiaryLabelColor
+                }
+                let statusBadge = badgeLabel(statusText, color: statusColor)
                 badgeStack.addArrangedSubview(statusBadge)
+                if retrying {
+                    retryStatusLabel = statusBadge.subviews.compactMap { $0 as? NSTextField }.first
+                }
                 if let taskPid {
                     badgeStack.addArrangedSubview(badgeLabel("pid \(taskPid)", color: .secondaryLabelColor))
                 }
@@ -1536,16 +1708,18 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
             } else if let configError {
                 errorBanner.stringValue = configError.components(separatedBy: "\n").first ?? configError
                 errorBanner.isHidden = false
+            } else if let taskStatus, retrying {
+                errorBanner.stringValue = retryBannerText(taskStatus)
+                errorBanner.isHidden = false
             } else if !running {
-                let status = app.supervisor.taskStatus(id: task.id)
-                if let status {
-                    if let exitCode = status.exitCode, exitCode != 0 {
+                if let taskStatus {
+                    if let exitCode = taskStatus.exitCode, exitCode != 0 {
                         var msg = "Exit code: \(exitCode)"
-                        if let err = status.lastError, !err.isEmpty { msg += " — \(err)" }
+                        if let err = taskStatus.lastError, !err.isEmpty { msg += " — \(err)" }
                         errorBanner.stringValue = msg
                         errorBanner.isHidden = false
-                    } else if status.state == .errored {
-                        errorBanner.stringValue = status.lastError ?? "Process exited with error"
+                    } else if taskStatus.state == .errored {
+                        errorBanner.stringValue = taskStatus.lastError ?? "Process exited with error"
                         errorBanner.isHidden = false
                     } else {
                         errorBanner.isHidden = true
@@ -1570,6 +1744,34 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
         // For broken tasks, show the full config error in the log area
         if let configError = app.taskError(for: task) {
             setLogText("[Config Error]\n\n\(configError)", color: .systemRed)
+        }
+    }
+
+    private func retryBannerText(_ status: TaskStatus) -> String {
+        var message = app.retryDescription(status)
+        if let error = status.lastError, !error.isEmpty {
+            message += " — \(error)"
+        }
+        return message
+    }
+
+    private func updateRetryCountdownDisplay() {
+        guard window?.isVisible == true, let task = selectedTask else { return }
+        guard let status = app.status(for: task), status.state == .retrying else {
+            if retryStatusLabel != nil {
+                updateDetail()
+            }
+            return
+        }
+
+        guard let retryStatusLabel else {
+            updateDetail()
+            return
+        }
+        retryStatusLabel.stringValue = "↻ \(app.retryDescription(status))"
+        if stickyError == nil, app.taskError(for: task) == nil {
+            errorBanner.stringValue = retryBannerText(status)
+            errorBanner.isHidden = false
         }
     }
 
@@ -1724,7 +1926,10 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
             let cell = tableView.makeView(withIdentifier: cellID, owner: self) as? NSTableCellView ?? NSTableCellView()
             cell.identifier = cellID
 
-            let running = app.isRunning(task)
+            let taskStatus = app.status(for: task)
+            let running = taskStatus?.state == .running
+            let retrying = taskStatus?.state == .retrying
+            let active = running || retrying
             let rowHeight: CGFloat = 28
             let cellWidth: CGFloat = 260
             let btnSize: CGFloat = 16
@@ -1772,20 +1977,25 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
             }
 
             // Update dynamic content only
-            let toggleIcon = running
+            let toggleIcon = active
                 ? NSImage(systemSymbolName: "stop.fill", accessibilityDescription: "Stop")
                 : NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Start")
             toggleBtn.image = toggleIcon
-            toggleBtn.contentTintColor = running ? .systemOrange : .systemGreen
-            toggleBtn.toolTip = running ? "Stop \(task.name)" : "Start \(task.name)"
-
-            nameField.stringValue = "\(running ? "● " : "○ ")\(task.name)"
-            nameField.textColor = running ? .textColor : .secondaryLabelColor
+            toggleBtn.contentTintColor = active ? .systemOrange : .systemGreen
+            if let taskStatus, retrying {
+                toggleBtn.toolTip = "Cancel \(app.retryDescription(taskStatus))"
+                nameField.stringValue = "↻ \(task.name)"
+                nameField.textColor = .systemOrange
+            } else {
+                toggleBtn.toolTip = running ? "Stop \(task.name)" : "Start \(task.name)"
+                nameField.stringValue = "\(running ? "● " : "○ ")\(task.name)"
+                nameField.textColor = running ? .textColor : .secondaryLabelColor
+            }
 
             restartBtn.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Restart")
             restartBtn.contentTintColor = .secondaryLabelColor
             restartBtn.toolTip = "Restart \(task.name)"
-            restartBtn.isHidden = !running
+            restartBtn.isHidden = !active
 
             return cell
         }
@@ -1834,7 +2044,7 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
     @objc private func sidebarToggleTask(_ sender: NSButton) {
         let row = rowForViewInSidebar(sender)
         guard row >= 0, row < sidebarItems.count, let task = sidebarItems[row].task else { return }
-        if app.isRunning(task) {
+        if app.isActive(task) {
             app.stop(task)
         } else {
             app.start(task)
@@ -2036,7 +2246,7 @@ final class DashboardWindowController: NSWindowController, NSTableViewDataSource
     @objc private func toggleSelectedTask() {
         let row = sidebarTable.clickedRow
         guard row >= 0, row < sidebarItems.count, let task = sidebarItems[row].task else { return }
-        app.isRunning(task) ? app.stop(task) : app.start(task)
+        app.isActive(task) ? app.stop(task) : app.start(task)
         reload()
     }
 
@@ -2238,9 +2448,11 @@ final class QuickLaunchPanel: NSWindowController, NSTableViewDataSource, NSTable
             ])
         }
 
-        let running = app.isRunning(task)
-        cell.textField?.stringValue = "\(running ? "● " : "○ ")\(task.name)"
-        cell.textField?.textColor = running ? .labelColor : .secondaryLabelColor
+        let taskStatus = app.status(for: task)
+        let running = taskStatus?.state == .running
+        let retrying = taskStatus?.state == .retrying
+        cell.textField?.stringValue = "\(running ? "● " : (retrying ? "↻ " : "○ "))\(task.name)"
+        cell.textField?.textColor = retrying ? .systemOrange : (running ? .labelColor : .secondaryLabelColor)
 
         // Set detail label
         for subview in cell.subviews {
@@ -2261,10 +2473,10 @@ final class QuickLaunchPanel: NSWindowController, NSTableViewDataSource, NSTable
         let row = tableView.selectedRow
         guard row >= 0, row < filteredTasks.count else { return }
         let task = filteredTasks[row]
-        let running = app.isRunning(task)
+        let active = app.isActive(task)
 
-        if running {
-            // Show action menu for running tasks
+        if active {
+            // Show action menu for running or retrying tasks
             let menu = NSMenu()
             menu.addItem(NSMenuItem(title: "Stop", action: #selector(stopFromQL), keyEquivalent: ""))
             menu.addItem(NSMenuItem(title: "Restart", action: #selector(restartFromQL), keyEquivalent: ""))
@@ -2722,10 +2934,8 @@ final class TaskEditorWindowController: NSWindowController {
 
     private func updateCheckboxVisibility() {
         let isDaemon = modeSegment.selectedSegment == 0
-        autoStartCheck.isEnabled = isDaemon
         keepAliveCheck.isEnabled = isDaemon
         if !isDaemon {
-            autoStartCheck.state = .off
             keepAliveCheck.state = .off
         }
     }

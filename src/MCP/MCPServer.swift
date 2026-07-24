@@ -209,7 +209,12 @@ final class MCPServer {
             let state = s.state.rawValue
             let pid = s.pid.map { " pid=\($0)" } ?? ""
             let dur = s.runningDuration.map { String(format: " uptime=%.0fs", $0) } ?? ""
-            return "\(s.id): \(s.name) [\(state)]\(pid)\(dur)"
+            let retry = if s.state == .retrying {
+                " attempt=\(s.retryAttempt ?? 1) retry_in=\(max(0, Int(ceil(s.nextRetryAt?.timeIntervalSinceNow ?? 0))))s"
+            } else {
+                ""
+            }
+            return "\(s.id): \(s.name) [\(state)]\(pid)\(dur)\(retry)"
         }.joined(separator: "\n")
     }
 
@@ -226,6 +231,13 @@ final class MCPServer {
         if let exit = status.exitCode { lines.append("Exit code: \(exit)") }
         if let started = status.startedAt { lines.append("Started: \(started)") }
         if let dur = status.runningDuration { lines.append(String(format: "Duration: %.0fs", dur)) }
+        if status.state == .retrying {
+            lines.append("Retry attempt: \(status.retryAttempt ?? 1)")
+            if let nextRetryAt = status.nextRetryAt {
+                lines.append("Next retry: \(nextRetryAt)")
+                lines.append("Retry in: \(max(0, Int(ceil(nextRetryAt.timeIntervalSinceNow))))s")
+            }
+        }
         if let err = status.lastError { lines.append("Last error: \(err)") }
         if let ports = status.ports, !ports.isEmpty {
             lines.append("Ports: \(ports.map(String.init).joined(separator: ", "))")

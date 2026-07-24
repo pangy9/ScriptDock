@@ -34,7 +34,7 @@ struct ScriptTask: Codable {
     }
 
     var effectiveMode: TaskMode {
-        mode ?? ((keepAlive == true || runAtLoad == true) ? .daemon : .oneshot)
+        mode ?? (keepAlive == true ? .daemon : .oneshot)
     }
 }
 
@@ -58,6 +58,7 @@ enum LogStream {
 enum TaskState: String, Codable {
     case stopped
     case running
+    case retrying
     case errored
 }
 
@@ -72,6 +73,8 @@ struct TaskStatus: Codable {
     let ports: [Int]?
     let runningDuration: TimeInterval?
     let startedBy: String?   // "mcp", "manual", "auto", or nil
+    let retryAttempt: Int?
+    let nextRetryAt: Date?
 }
 
 /// A pre-defined optional argument that can be toggled at task start

@@ -59,7 +59,9 @@ final class SupervisorClient {
             return cached
         }
         guard let result = request("/api/tasks"), result.status == 200 else { return nil }
-        let statuses = try? JSONDecoder().decode([TaskStatus].self, from: result.data)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let statuses = try? decoder.decode([TaskStatus].self, from: result.data)
         cachedStatuses = statuses
         cacheTime = Date()
         return statuses
