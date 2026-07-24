@@ -21,6 +21,12 @@ jobs:
       - name: Build
         run: make
 
+      - name: Validate app bundle
+        run: |
+          codesign --verify --deep --strict --verbose=2 ScriptDock.app
+          APP_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' ScriptDock.app/Contents/Info.plist)
+          test "v${APP_VERSION}" = "${GITHUB_REF_NAME}"
+
       - name: Zip app
         run: |
           cd ScriptDock.app/..

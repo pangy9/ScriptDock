@@ -6,7 +6,7 @@ ICON := src/Resources/AppIcon.icns
 
 .PHONY: all build mcp run test clean
 
-all: build mcp
+all: build
 
 build:
 	mkdir -p "$(APP_DIR)/Contents/MacOS"
@@ -14,11 +14,11 @@ build:
 	cp src/Info.plist "$(APP_DIR)/Contents/Info.plist"
 	cp "$(ICON)" "$(APP_DIR)/Contents/Resources/AppIcon.icns"
 	swiftc $(SRCS) -parse-as-library -o "$(APP_DIR)/Contents/MacOS/$(APP_NAME)"
+	swiftc $(MCP_SRCS) -parse-as-library -o "$(APP_DIR)/Contents/MacOS/scriptdock-mcp" -O
 	codesign -f -s - "$(APP_DIR)"
 	touch "$(APP_DIR)"
 
 mcp: build
-	swiftc $(MCP_SRCS) -parse-as-library -o "$(APP_DIR)/Contents/MacOS/scriptdock-mcp" -O
 
 run: build
 	open "$(APP_DIR)"
